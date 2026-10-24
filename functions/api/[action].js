@@ -16,14 +16,36 @@ export async function onRequestOptions() {
   return new Response(null, { headers: cors });
 }
 
-// 浏览器直接打开 /api/ping 用来测试接口是否正常
-export async function onRequestGet() {
-  return json({ ok: true, hint: 'api alive' });
+// 浏览器直接打开 /api/ping：检查接口是否在跑，以及数据库绑定、表是否正常
+export async function onRequestGet({ env }) {
+  let db = 'ok';
+  if (!env.DB) {
+    db = '未绑定：到 Settings → Bindings 添加 D1，变量名必须是 DB，然后重新部署';
+  } else {
+    try {
+      for (const t of ['users', 'sessions', 'saves']) {
+        await env.DB.prepare(`SELECT 1 FROM ${t} LIMIT 1`).first();
+      }
+    } catch (e) {
+      db = '表缺失或出错：' + (e && e.message ? e.message : e);
+    }
+  }
+  return json({ ok: true, hint: 'api alive', db });
 }
 
-export async function onRequestPost({ request, env, params }) {
-  const body = await request.json().catch(() => ({}));
+export async function onRequestPost(ctx) {
+  try {
+    return await route(ctx);
+  } catch (e) {
+    return json({ error: '服务器错误：' + (e && e.message ? e.message : e) }, 500);
+  }
+}
+
+async function route({ request, env, params }) {
   const db = env.DB;
+  if (!db) return json({ error: '数据库未绑定（Settings → Bindings，变量名 DB）' }, 500);
+
+  const body = await request.json().catch(() => ({}));
   const action = params.action;
 
   if (action === 'register' || action === 'login') {
@@ -37,8 +59,11 @@ export async function onRequestPost({ request, env, params }) {
         await db.prepare('INSERT INTO users (username, password) VALUES (?, ?)')
           .bind(username, password).run();
         return json({ ok: true });
-      } catch {
-        return json({ error: '用户名已存在' }, 409);
+      } catch (e) {
+        if (/UNIQUE|constraint/i.test(String(e && e.message))) {
+          return json({ error: '用户名已存在' }, 409);
+        }
+        throw e; // 其它错误（比如没建表）交给外层，返回真实原因
       }
     }
 
