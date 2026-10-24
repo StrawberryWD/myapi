@@ -11,6 +11,7 @@ const json = (obj, status = 200) =>
 
 const SESSION_MS = 30 * 24 * 3600 * 1000; // 登录 30 天有效
 const MAX_SAVE = 20000;                   // 存档最大字符数
+const HIDDEN = ['admin', 'root'];         // 不上榜、不可注销的账号
 
 export async function onRequestOptions() {
   return new Response(null, { headers: cors });
@@ -106,6 +107,48 @@ async function route({ request, env, params }) {
     if (action === 'logout') {
       await db.prepare('DELETE FROM sessions WHERE token = ?').bind(String(body.token)).run();
     }
+    return json({ ok: true });
+  }
+
+  // ---------- 排行榜：学校总积分 + 个人总积分（不含 admin / root） ----------
+  if (action === 'rank') {
+    const { results } = await db.prepare(
+      `SELECT username, data FROM saves WHERE lower(username) NOT IN (${HIDDEN.map(() => '?').join(',')})`
+    ).bind(...HIDDEN).all();
+
+    const schools = {};
+    const players = [];
+    for (const r of results || []) {
+      let d;
+      try { d = JSON.parse(r.data); } catch { continue; }
+      if (!d || typeof d !== 'object') continue;
+      const pts = Math.max(0, Number(d.pts) | 0);
+      players.push({ username: r.username, pts, school: typeof d.school === 'string' ? d.school : null });
+      if (d.spts && typeof d.spts === 'object') {
+        for (const [name, v] of Object.entries(d.spts)) {
+          const n = Math.max(0, Number(v) | 0);
+          if (n) schools[name] = (schools[name] || 0) + n;
+        }
+      }
+    }
+    players.sort((a, b) => b.pts - a.pts);
+    return json({
+      ok: true,
+      schools: Object.entries(schools).map(([name, pts]) => ({ name, pts })),
+      players: players.slice(0, 100),
+    });
+  }
+
+  // ---------- 注销账户：删除用户、存档、所有登录会话 ----------
+  if (action === 'delete') {
+    if (HIDDEN.includes(sess.username.toLowerCase())) {
+      return json({ error: '该账户不允许注销' }, 403);
+    }
+    await db.batch([
+      db.prepare('DELETE FROM saves WHERE username = ?').bind(sess.username),
+      db.prepare('DELETE FROM sessions WHERE username = ?').bind(sess.username),
+      db.prepare('DELETE FROM users WHERE username = ?').bind(sess.username),
+    ]);
     return json({ ok: true });
   }
 
