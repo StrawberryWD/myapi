@@ -13,6 +13,69 @@ const SESSION_MS = 30 * 24 * 3600 * 1000; // 登录 30 天有效
 const MAX_SAVE = 20000;                   // 存档最大字符数
 const HIDDEN = ['admin', 'root'];         // 不上榜、不可注销的账号
 
+// ---------- 防积分作弊 ----------
+// 积分由前端计算，所以服务器不信任客户端上报的数值，而是用“令牌桶”限制积分增长速度：
+//   · 每秒最多增长 RATE 分（正常游戏理论上限约 3.6 分/秒，这里留了余量）
+//   · 桶容量 CAP：允许短时间离线/网络差后补报，但一次最多补报 CAP 分
+//   · 积分只允许减少（清空进度），不允许超速增加
+//   · pts 一律由服务器按 spts 求和得出，学校名必须在白名单内
+const SCHOOL_NAMES = [
+  '辽宁省实验中学', '东北育才高中', '沈阳二中', '沈阳市第一二六中学', '沈阳市虹桥中学',
+  '沈阳市43中学', '沈阳七中', '沈阳市第一三四中学', '沈阳市南昌中学', '本溪市第一高级中学',
+  '鞍山一中', '大连二十四中学', '大连育明高级中学', '雨田实验中学',
+];
+const SCHOOL_SET = new Set(SCHOOL_NAMES);
+const RATE = 4;     // 分/秒
+const CAP = 120;    // 令牌桶容量（分）
+
+function cleanSpts(o) {
+  const r = {};
+  if (o && typeof o === 'object') {
+    for (const k of SCHOOL_NAMES) {
+      const v = Number(o[k]);
+      if (Number.isFinite(v) && v > 0) r[k] = Math.min(Math.floor(v), 1e7);
+    }
+  }
+  return r;
+}
+
+// prev：数据库里已有的存档（可信）；data：客户端上传的存档（不可信）
+function applyScoring(prev, data, now) {
+  const out = data && typeof data === 'object' && !Array.isArray(data) ? { ...data } : {};
+  const old = cleanSpts(prev && prev.spts);
+  const want = cleanSpts(out.spts);
+  const claimedPts = Number(out.pts) | 0;
+
+  let budget = CAP;
+  if (prev && typeof prev._b === 'number' && typeof prev._t === 'number') {
+    budget = Math.min(CAP, Math.max(0, prev._b) + (RATE * Math.max(0, now - prev._t)) / 1000);
+  }
+
+  const fin = {};
+  const claims = [];
+  for (const s of SCHOOL_NAMES) {
+    const o = old[s] || 0, w = want[s] || 0;
+    const base = w <= o ? w : o;          // 减少直接接受；增加部分按额度审批
+    if (base > 0) fin[s] = base;
+    if (w > o) claims.push([s, w - o]);
+  }
+  let clamped = false;
+  for (const [s, c] of claims) {
+    const g = Math.min(c, Math.floor(budget));
+    if (g > 0) { fin[s] = (fin[s] || 0) + g; budget -= g; }
+    if (g < c) clamped = true;
+  }
+  const sum = Object.values(fin).reduce((a, b) => a + b, 0);
+  if (claimedPts !== sum) clamped = true;
+
+  out.spts = fin;
+  out.pts = sum;
+  out.school = SCHOOL_SET.has(out.school) ? out.school : null;
+  out._b = budget;          // 服务器自己维护的额度，客户端传的会被覆盖
+  out._t = now;
+  return { out, clamped };
+}
+
 export async function onRequestOptions() {
   return new Response(null, { headers: cors });
 }
@@ -96,18 +159,26 @@ async function route({ request, env, params }) {
   }
 
   if (action === 'save' || action === 'logout') {
+    let fix;
     if (body.data) {
-      const text = JSON.stringify(body.data);
+      const prevRow = await db.prepare('SELECT data FROM saves WHERE username = ?')
+        .bind(sess.username).first();
+      let prev = null;
+      if (prevRow) { try { prev = JSON.parse(prevRow.data); } catch {} }
+
+      const { out, clamped } = applyScoring(prev, body.data, Date.now());
+      const text = JSON.stringify(out);
       if (text.length > MAX_SAVE) return json({ error: '存档过大' }, 413);
       await db.prepare(
         'INSERT INTO saves (username, data, updated_at) VALUES (?, ?, ?) ' +
         'ON CONFLICT(username) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at'
       ).bind(sess.username, text, Date.now()).run();
+      if (clamped) fix = { pts: out.pts, spts: out.spts };   // 通知前端：积分已被服务器校正
     }
     if (action === 'logout') {
       await db.prepare('DELETE FROM sessions WHERE token = ?').bind(String(body.token)).run();
     }
-    return json({ ok: true });
+    return json(fix ? { ok: true, fix } : { ok: true });
   }
 
   // ---------- 排行榜：学校总积分 + 个人总积分（不含 admin / root） ----------
@@ -122,14 +193,14 @@ async function route({ request, env, params }) {
       let d;
       try { d = JSON.parse(r.data); } catch { continue; }
       if (!d || typeof d !== 'object') continue;
-      const pts = Math.max(0, Number(d.pts) | 0);
-      players.push({ username: r.username, pts, school: typeof d.school === 'string' ? d.school : null });
-      if (d.spts && typeof d.spts === 'object') {
-        for (const [name, v] of Object.entries(d.spts)) {
-          const n = Math.max(0, Number(v) | 0);
-          if (n) schools[name] = (schools[name] || 0) + n;
-        }
+      // 只信 spts（白名单学校、取整），个人积分由它求和得出
+      const sp = cleanSpts(d.spts);
+      let pts = 0;
+      for (const [name, n] of Object.entries(sp)) {
+        pts += n;
+        schools[name] = (schools[name] || 0) + n;
       }
+      players.push({ username: r.username, pts, school: SCHOOL_SET.has(d.school) ? d.school : null });
     }
     players.sort((a, b) => b.pts - a.pts);
     return json({
