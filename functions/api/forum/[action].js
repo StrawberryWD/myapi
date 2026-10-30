@@ -46,12 +46,13 @@ const SCHEMA = [
   'CREATE TABLE IF NOT EXISTS likes (post_id INTEGER NOT NULL, username TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (post_id, username))',
   'CREATE INDEX IF NOT EXISTS idx_likes_user ON likes (username)',
   // 帖子投票：options 是 JSON 数组；poll_votes 每个被选中的选项一行
-  'CREATE TABLE IF NOT EXISTS polls (post_id INTEGER PRIMARY KEY, multi INTEGER NOT NULL DEFAULT 0, closes_at INTEGER, options TEXT NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS polls (post_id INTEGER PRIMARY KEY, multi INTEGER NOT NULL DEFAULT 0, closes_at INTEGER, options TEXT NOT NULL, anon INTEGER NOT NULL DEFAULT 1, vis TEXT NOT NULL DEFAULT \'after\')',
   'CREATE TABLE IF NOT EXISTS poll_votes (post_id INTEGER NOT NULL, username TEXT NOT NULL, opt INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (post_id, username, opt))',
   // 问卷
   `CREATE TABLE IF NOT EXISTS surveys (
      id INTEGER PRIMARY KEY AUTOINCREMENT, author TEXT NOT NULL, title TEXT NOT NULL, descr TEXT NOT NULL DEFAULT '',
-     questions TEXT NOT NULL, created_at INTEGER NOT NULL, closes_at INTEGER, closed INTEGER NOT NULL DEFAULT 0)`,
+     questions TEXT NOT NULL, created_at INTEGER NOT NULL, closes_at INTEGER, closed INTEGER NOT NULL DEFAULT 0,
+     anon INTEGER NOT NULL DEFAULT 1, vis TEXT NOT NULL DEFAULT 'after', texts_public INTEGER NOT NULL DEFAULT 0)`,
   'CREATE INDEX IF NOT EXISTS idx_surveys_author ON surveys (author, created_at)',
   `CREATE TABLE IF NOT EXISTS survey_responses (
      survey_id INTEGER NOT NULL, username TEXT NOT NULL, answers TEXT NOT NULL, created_at INTEGER NOT NULL,
@@ -79,6 +80,13 @@ export async function onRequestGet({ env }) {
 async function ensureSchema(db) {
   if (schemaReady) return;
   await db.batch(SCHEMA.map((q) => db.prepare(q)));
+  // 旧版本已建好的表补上「匿名 / 公开范围」列（已有则忽略报错）：旧的投票和问卷保持原来的行为（匿名、投完 / 填完才能看结果）
+  const ALTERS = [
+    "ALTER TABLE polls ADD COLUMN anon INTEGER NOT NULL DEFAULT 1", "ALTER TABLE polls ADD COLUMN vis TEXT NOT NULL DEFAULT 'after'",
+    "ALTER TABLE surveys ADD COLUMN anon INTEGER NOT NULL DEFAULT 1", "ALTER TABLE surveys ADD COLUMN vis TEXT NOT NULL DEFAULT 'after'",
+    "ALTER TABLE surveys ADD COLUMN texts_public INTEGER NOT NULL DEFAULT 0",
+  ];
+  for (const q of ALTERS) { try { await db.prepare(q).run(); } catch (e) { /* 列已存在 */ } }
   schemaReady = true;
 }
 
@@ -133,7 +141,7 @@ async function route({ request, env, params }) {
         .bind(id, LIMITS.MAX_REPLIES).all();
       const lk = await db.prepare('SELECT COUNT(*) AS n, SUM(username = ?2) AS me FROM likes WHERE post_id = ?1').bind(id, user).first();
       post.like_count = (lk && lk.n) || 0; post.liked = !!(lk && lk.me);
-      return json({ ok: true, me: user, admin: isAdmin, post, replies: results, poll: await loadPoll(db, id, user, now) });
+      return json({ ok: true, me: user, admin: isAdmin, post, replies: results, poll: await loadPoll(db, id, user, now, isAdmin) });
     }
 
     case 'create': {
@@ -151,7 +159,7 @@ async function route({ request, env, params }) {
       const r = await db.prepare('INSERT INTO posts (author, title, body, created_at, last_at, reply_count) VALUES (?1, ?2, ?3, ?4, ?4, 0)')
         .bind(user, title, body, now).run();
       const id = r.meta.last_row_id;
-      if (poll) await db.prepare('INSERT INTO polls (post_id, multi, closes_at, options) VALUES (?1, ?2, ?3, ?4)').bind(id, poll.multi, poll.closes_at, JSON.stringify(poll.options)).run();
+      if (poll) await db.prepare('INSERT INTO polls (post_id, multi, closes_at, options, anon, vis) VALUES (?1, ?2, ?3, ?4, ?5, ?6)').bind(id, poll.multi, poll.closes_at, JSON.stringify(poll.options), poll.anon, poll.vis).run();
       if (id % 20 === 0) {   // 每 20 个帖子顺手清理一次，只留最近活跃的 KEEP_POSTS 个
         await db.batch([
           db.prepare('DELETE FROM posts WHERE id IN (SELECT id FROM posts ORDER BY last_at DESC, id DESC LIMIT -1 OFFSET ?1)').bind(LIMITS.KEEP_POSTS),
@@ -238,7 +246,7 @@ async function route({ request, env, params }) {
       const done = await db.prepare('SELECT 1 AS x FROM poll_votes WHERE post_id = ?1 AND username = ?2 LIMIT 1').bind(pid, user).first();
       if (done) return fail('你已经投过票了', 400, 'poll_done');
       await db.batch(sel.map((i) => db.prepare('INSERT OR IGNORE INTO poll_votes (post_id, username, opt, created_at) VALUES (?1, ?2, ?3, ?4)').bind(pid, user, i, now)));
-      return json({ ok: true, poll: await loadPoll(db, pid, user, now) });
+      return json({ ok: true, poll: await loadPoll(db, pid, user, now, isAdmin) });
     }
 
     // ---------- 问卷 ----------
@@ -261,7 +269,8 @@ async function route({ request, env, params }) {
       return json({ ok: true, me: user, admin: isAdmin, survey: {
         id: sv.id, author: sv.author, av: sv.av, title: sv.title, descr: sv.descr, created_at: sv.created_at, closes_at: sv.closes_at,
         closed: svClosed(sv, now), questions: JSON.parse(sv.questions), resp_count: cnt.n,
-      }, done: !!mine, my_answers: mine ? JSON.parse(mine.answers) : null, owner, can_results: owner || isAdmin || !!mine });
+        anon: !!sv.anon, vis: sv.vis, texts_public: !!sv.texts_public,
+      }, done: !!mine, my_answers: mine ? JSON.parse(mine.answers) : null, owner, can_results: owner || isAdmin || sv.vis === 'public' || (sv.vis === 'after' && !!mine) });
     }
 
     case 'survey_create': {
@@ -279,8 +288,8 @@ async function route({ request, env, params }) {
         const last = await db.prepare('SELECT MAX(created_at) AS t FROM surveys WHERE author = ?1').bind(user).first();
         if (last && last.t && now - last.t < LIMITS.SV_GAP_MS) return fail('创建得太快啦，稍等几秒再建', 429, 'too_fast');
       }
-      const r = await db.prepare('INSERT INTO surveys (author, title, descr, questions, created_at, closes_at, closed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)')
-        .bind(user, title, descr || '', JSON.stringify(qs), now, closes).run();
+      const r = await db.prepare('INSERT INTO surveys (author, title, descr, questions, created_at, closes_at, closed, anon, vis, texts_public) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9)')
+        .bind(user, title, descr || '', JSON.stringify(qs), now, closes, b.anon === false || b.anon === 0 ? 0 : 1, VIS.includes(b.vis) ? b.vis : 'after', b.texts_public ? 1 : 0).run();
       const id = r.meta.last_row_id;
       if (id % 20 === 0) {
         await db.batch([
@@ -303,29 +312,38 @@ async function route({ request, env, params }) {
       return json({ ok: true });
     }
 
-    case 'survey_results': {   // 发起人和管理员看全部（含填空内容）；填过的人只看选择题的统计；谁填了什么，任何人都看不到
+    case 'survey_results': {   // 谁能看由发起人设定（vis）；发起人和管理员永远能看。匿名问卷不返回任何人的身份
       const sv = await db.prepare('SELECT * FROM surveys WHERE id = ?1').bind(Number(b.id)).first();
       if (!sv) return fail('问卷不存在或已被删除', 404, 'sv_gone');
       const full = sv.author === user || isAdmin;
       if (!full) {
-        const mine = await db.prepare('SELECT 1 AS x FROM survey_responses WHERE survey_id = ?1 AND username = ?2').bind(sv.id, user).first();
-        if (!mine) return fail('填写后才能查看结果', 403, 'sv_need_submit');
+        if (sv.vis === 'owner') return fail('这份问卷的结果只有发起人能看', 403, 'sv_owner_only');
+        if (sv.vis === 'after') {
+          const mine = await db.prepare('SELECT 1 AS x FROM survey_responses WHERE survey_id = ?1 AND username = ?2').bind(sv.id, user).first();
+          if (!mine) return fail('填写后才能查看结果', 403, 'sv_need_submit');
+        }
       }
+      const showTexts = full || !!sv.texts_public;
+      const named = !sv.anon;
       const qs = JSON.parse(sv.questions);
-      const { results } = await db.prepare('SELECT answers FROM survey_responses WHERE survey_id = ?1 ORDER BY created_at').bind(sv.id).all();
-      const out = qs.map((q) => ({ counts: q.t === 'text' ? undefined : q.opts.map(() => 0), answered: 0, texts: q.t === 'text' && full ? [] : undefined }));
+      const { results } = await db.prepare('SELECT username, answers FROM survey_responses WHERE survey_id = ?1 ORDER BY created_at').bind(sv.id).all();
+      const out = qs.map((q) => ({
+        counts: q.t === 'text' ? undefined : q.opts.map(() => 0), answered: 0,
+        names: q.t !== 'text' && named ? q.opts.map(() => []) : undefined,
+        texts: q.t === 'text' && showTexts ? [] : undefined,
+      }));
       for (const row of results) {
         let a; try { a = JSON.parse(row.answers); } catch { continue; }
         qs.forEach((q, i) => {
           const v = a[i];
-          if (q.t === 'single') { if (Number.isInteger(v) && out[i].counts[v] != null) { out[i].counts[v]++; out[i].answered++; } }
-          else if (q.t === 'multi') { if (Array.isArray(v) && v.length) { out[i].answered++; v.forEach((k) => { if (out[i].counts[k] != null) out[i].counts[k]++; }); } }
-          else if (typeof v === 'string' && v) { out[i].answered++; if (full) out[i].texts.push(v); }
+          if (q.t === 'single') { if (Number.isInteger(v) && out[i].counts[v] != null) { out[i].counts[v]++; out[i].answered++; if (out[i].names) out[i].names[v].push(row.username); } }
+          else if (q.t === 'multi') { if (Array.isArray(v) && v.length) { out[i].answered++; v.forEach((k) => { if (out[i].counts[k] != null) { out[i].counts[k]++; if (out[i].names) out[i].names[k].push(row.username); } }); } }
+          else if (typeof v === 'string' && v) { out[i].answered++; if (showTexts) out[i].texts.push(named ? { u: row.username, v } : v); }
         });
       }
-      // 填空内容按字典序打乱顺序，避免从提交先后猜出是谁
-      out.forEach((o) => { if (o.texts) o.texts.sort(() => Math.random() - 0.5); });
-      return json({ ok: true, total: results.length, full, questions: out });
+      // 匿名问卷的填空内容打乱顺序，避免从提交先后猜出是谁
+      if (!named) out.forEach((o) => { if (o.texts) o.texts.sort(() => Math.random() - 0.5); });
+      return json({ ok: true, total: results.length, full, anon: !sv.anon ? false : true, vis: sv.vis, texts_public: !!sv.texts_public, questions: out });
     }
 
     case 'survey_close': {   // 发起人 / 管理员：关闭或重新开放
@@ -400,6 +418,8 @@ function userContentCleanup(db, u) {
   ];
 }
 
+// 结果公开范围：public 所有人随时可看；after 投完 / 填完（或投票已截止）才能看；owner 只有发起人和管理员能看
+const VIS = ['public', 'after', 'owner'];
 const svClosed = (s, now) => !!s.closed || !!(s.closes_at && now > s.closes_at);
 
 // 帖子投票：校验发帖时附带的 poll = { options: [...], multi: bool, hours: number|null }，出错返回字符串
@@ -416,23 +436,32 @@ function parsePoll(p, now) {
   if (opts.length > LIMITS.POLL_OPTS_MAX) return `投票最多 ${LIMITS.POLL_OPTS_MAX} 个选项`;
   const hrs = Number(p.hours);
   const closes_at = hrs > 0 ? now + Math.min(hrs, LIMITS.POLL_MAX_HOURS) * 3600000 : null;
-  return { options: opts, multi: p.multi ? 1 : 0, closes_at };
+  return { options: opts, multi: p.multi ? 1 : 0, closes_at, anon: p.anon === false || p.anon === 0 ? 0 : 1, vis: VIS.includes(p.vis) ? p.vis : 'after' };
 }
 
-// 读取某个帖子的投票：选项、各项票数、总人数、我投了哪些（不返回任何人的身份）
-async function loadPoll(db, pid, user, now) {
-  const po = await db.prepare('SELECT multi, closes_at, options FROM polls WHERE post_id = ?1').bind(pid).first();
+// 读取某个帖子的投票：选项、总人数、我投了哪些；票数 / 名单只在「有权看结果」时才返回
+// 匿名投票（anon=1）永远不返回任何人的身份；实名投票（anon=0）在有权看结果时返回每个选项的投票人名单
+async function loadPoll(db, pid, user, now, isAdmin) {
+  const po = await db.prepare('SELECT p.multi, p.closes_at, p.options, p.anon, p.vis, s.author FROM polls p JOIN posts s ON s.id = p.post_id WHERE p.post_id = ?1').bind(pid).first();
   if (!po) return null;
   const options = JSON.parse(po.options);
-  const { results } = await db.prepare('SELECT opt, COUNT(*) AS n FROM poll_votes WHERE post_id = ?1 GROUP BY opt').bind(pid).all();
-  const counts = options.map(() => 0);
-  for (const r of results) if (counts[r.opt] != null) counts[r.opt] = r.n;
+  const closed = !!(po.closes_at && now > po.closes_at);
+  const owner = po.author === user;
   const tv = await db.prepare('SELECT COUNT(DISTINCT username) AS n FROM poll_votes WHERE post_id = ?1').bind(pid).first();
   const mine = await db.prepare('SELECT opt FROM poll_votes WHERE post_id = ?1 AND username = ?2 ORDER BY opt').bind(pid, user).all();
-  return {
-    options, multi: !!po.multi, closes_at: po.closes_at, closed: !!(po.closes_at && now > po.closes_at),
-    counts, voters: tv.n, mine: mine.results.map((r) => r.opt),
+  const voted = mine.results.length > 0;
+  const canSee = po.vis === 'public' || owner || isAdmin || (po.vis === 'after' && (voted || closed));
+  const out = {
+    options, multi: !!po.multi, closes_at: po.closes_at, closed, anon: !!po.anon, vis: po.vis, owner,
+    voters: tv.n, mine: mine.results.map((r) => r.opt), can_see: canSee, counts: null, names: null,
   };
+  if (canSee) {
+    const { results } = await db.prepare('SELECT opt, username FROM poll_votes WHERE post_id = ?1 ORDER BY created_at, username').bind(pid).all();
+    out.counts = options.map(() => 0);
+    if (!po.anon) out.names = options.map(() => []);
+    for (const r of results) if (out.counts[r.opt] != null) { out.counts[r.opt]++; if (out.names) out.names[r.opt].push(r.username); }
+  }
+  return out;
 }
 
 // 问卷题目校验：[{ t: 'single'|'multi'|'text', q: '题目', opts: [...], req: bool }]
