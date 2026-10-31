@@ -28,7 +28,20 @@ const LIMITS = {
   SV_GAP_MS: 30000,    // 同一用户两次建问卷最小间隔
   KEEP_SURVEYS: 300,   // 最多保留的问卷数
   SV_PAGE: 50,
+  TOPIC_NAME: 20, TOPIC_DESC: 100, TOPICS_MAX: 200, TOPICS_PER_POST: 3, TAGS_PER_POST: 5, TAG_LEN: 20,   // 话题 / 标签
+  PIN_MAX: 3,          // 每个范围（全站 / 某话题）最多同时置顶几条
+  MAX_DEPTH: 2,        // 评论嵌套：0 / 1 / 2 共 3 层，更深的回复归到第 3 层
+  FOLDER_NAME: 20, FOLDERS_MAX: 20, MARK_PAGE: 20,   // 收藏夹
+  TOPIC_GAP_MS: 10000, // 同一用户两次建话题最小间隔
 };
+const EMSG = {
+  topics_many: '每个帖子最多选 3 个话题', tags_many: '每个帖子最多 5 个标签', tag_len: '标签最多 20 字', topic_gone: '话题不存在',
+  topic_exists: '已有同名话题', topic_name: '请填写话题名称（最多 20 字）', topic_desc: '话题说明最多 100 字', topic_many: '话题数量已达上限',
+  topic_forbidden: '只有话题创建者或管理员能操作', pin_forbidden: '没有置顶权限', pin_full: '置顶已满（每个范围最多 3 条）',
+  pin_scope: '这个帖子不属于该话题', folder_gone: '收藏夹不存在', folder_name: '请填写收藏夹名称（最多 20 字）', folder_many: '收藏夹最多 20 个',
+  post_gone: '帖子不存在或已被删除', admin_only: '需要管理员权限', reply_gone: '这条回复不存在或已被删除', edit_forbidden: '只能修改自己的内容',
+};
+const failc = (code, status = 400, extra) => json({ ok: false, error: EMSG[code] || code, code, ...(extra || {}) }, status);
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS posts (
@@ -48,6 +61,18 @@ const SCHEMA = [
   // 帖子投票：options 是 JSON 数组；poll_votes 每个被选中的选项一行
   'CREATE TABLE IF NOT EXISTS polls (post_id INTEGER PRIMARY KEY, multi INTEGER NOT NULL DEFAULT 0, closes_at INTEGER, options TEXT NOT NULL, anon INTEGER NOT NULL DEFAULT 1, vis TEXT NOT NULL DEFAULT \'after\')',
   'CREATE TABLE IF NOT EXISTS poll_votes (post_id INTEGER NOT NULL, username TEXT NOT NULL, opt INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (post_id, username, opt))',
+  'CREATE TABLE IF NOT EXISTS reply_likes (reply_id INTEGER NOT NULL, username TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (reply_id, username))',
+  // 话题（板块）/ 标签 / 置顶 / 收藏
+  'CREATE TABLE IF NOT EXISTS topics (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL COLLATE NOCASE UNIQUE, descr TEXT NOT NULL DEFAULT \'\', creator TEXT NOT NULL, created_at INTEGER NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS post_topics (post_id INTEGER NOT NULL, topic_id INTEGER NOT NULL, PRIMARY KEY (post_id, topic_id))',
+  'CREATE INDEX IF NOT EXISTS idx_pt_topic ON post_topics (topic_id, post_id)',
+  'CREATE TABLE IF NOT EXISTS post_tags (post_id INTEGER NOT NULL, tag TEXT NOT NULL COLLATE NOCASE, PRIMARY KEY (post_id, tag))',
+  'CREATE INDEX IF NOT EXISTS idx_ptag_tag ON post_tags (tag, post_id)',
+  'CREATE TABLE IF NOT EXISTS pins (scope TEXT NOT NULL, post_id INTEGER NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER, by TEXT NOT NULL, PRIMARY KEY (scope, post_id))',
+  'CREATE TABLE IF NOT EXISTS bookmark_folders (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL)',
+  'CREATE INDEX IF NOT EXISTS idx_bf_user ON bookmark_folders (username)',
+  'CREATE TABLE IF NOT EXISTS bookmarks (username TEXT NOT NULL, post_id INTEGER NOT NULL, folder_id INTEGER, created_at INTEGER NOT NULL, PRIMARY KEY (username, post_id))',
+  'CREATE INDEX IF NOT EXISTS idx_bm_post ON bookmarks (post_id)',
   // 问卷
   `CREATE TABLE IF NOT EXISTS surveys (
      id INTEGER PRIMARY KEY AUTOINCREMENT, author TEXT NOT NULL, title TEXT NOT NULL, descr TEXT NOT NULL DEFAULT '',
@@ -85,6 +110,10 @@ async function ensureSchema(db) {
     "ALTER TABLE polls ADD COLUMN anon INTEGER NOT NULL DEFAULT 1", "ALTER TABLE polls ADD COLUMN vis TEXT NOT NULL DEFAULT 'after'",
     "ALTER TABLE surveys ADD COLUMN anon INTEGER NOT NULL DEFAULT 1", "ALTER TABLE surveys ADD COLUMN vis TEXT NOT NULL DEFAULT 'after'",
     "ALTER TABLE surveys ADD COLUMN texts_public INTEGER NOT NULL DEFAULT 0",
+    // V2：多层评论 / 软删除 / 编辑
+    "ALTER TABLE replies ADD COLUMN parent_id INTEGER", "ALTER TABLE replies ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE replies ADD COLUMN reply_to TEXT", "ALTER TABLE replies ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE replies ADD COLUMN edited_at INTEGER", "ALTER TABLE posts ADD COLUMN edited_at INTEGER",
   ];
   for (const q of ALTERS) { try { await db.prepare(q).run(); } catch (e) { /* 列已存在 */ } }
   schemaReady = true;
@@ -111,36 +140,64 @@ async function route({ request, env, params }) {
 
   switch (params.action) {
     case 'list': {
-      const lastAt = Number(b.last_at), lastId = Number(b.last_id);
-      const cursor = b.last_at != null && Number.isFinite(lastAt) && Number.isFinite(lastId);
-      const stmt = cursor
-        ? db.prepare(`SELECT p.id, p.author, p.title, substr(p.body, 1, 80) AS snippet, p.created_at, p.last_at, p.reply_count, a.updated_at AS av,
-                             (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
-                             (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id AND l.username = ?4) AS liked,
-                             (SELECT COUNT(*) FROM polls o WHERE o.post_id = p.id) AS has_poll
-                      FROM posts p LEFT JOIN avatars a ON a.username = p.author
-                      WHERE p.last_at < ?1 OR (p.last_at = ?1 AND p.id < ?2)
-                      ORDER BY p.last_at DESC, p.id DESC LIMIT ?3`).bind(lastAt, lastId, LIMITS.PAGE + 1, user)
-        : db.prepare(`SELECT p.id, p.author, p.title, substr(p.body, 1, 80) AS snippet, p.created_at, p.last_at, p.reply_count, a.updated_at AS av,
-                             (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
-                             (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id AND l.username = ?2) AS liked,
-                             (SELECT COUNT(*) FROM polls o WHERE o.post_id = p.id) AS has_poll
-                      FROM posts p LEFT JOIN avatars a ON a.username = p.author
-                      ORDER BY p.last_at DESC, p.id DESC LIMIT ?1`).bind(LIMITS.PAGE + 1, user);
-      const { results } = await stmt.all();
-      return json({ ok: true, me: user, admin: isAdmin, posts: results.slice(0, LIMITS.PAGE).map((r) => ({ ...r, liked: !!r.liked, has_poll: !!r.has_poll })), hasMore: results.length > LIMITS.PAGE });
+      // 排序：active 最近活动 / new 发布时间 / likes 赞数 / replies 回复数 / marks 收藏数；dir 升降序；topic / tag / q 筛选；offset 翻页
+      const SORTS = { active: 'p.last_at', new: 'p.id', likes: 'like_count', replies: 'p.reply_count', marks: 'mark_count' };
+      const sort = SORTS[b.sort] ? b.sort : 'active';
+      const dir = b.dir === 'asc' ? 'ASC' : 'DESC';
+      const offset = Math.max(0, Math.floor(Number(b.offset)) || 0);
+      const topic = Number(b.topic) > 0 ? Math.floor(Number(b.topic)) : 0;
+      const tag = clean(String(b.tag || '').replace(/^#+/, ''), LIMITS.TAG_LEN) || '';
+      const q = clean(String(b.q || ''), 30) || '';
+      const where = [], args = [];
+      if (topic) { where.push('p.id IN (SELECT post_id FROM post_topics WHERE topic_id = ?)'); args.push(topic); }
+      if (tag) { where.push('p.id IN (SELECT post_id FROM post_tags WHERE tag = ?)'); args.push(tag); }
+      if (q) { const like = '%' + q.replace(/[\\%_]/g, (c) => '\\' + c) + '%'; where.push("(p.title LIKE ? ESCAPE '\\' OR p.body LIKE ? ESCAPE '\\')"); args.push(like, like); }
+      // 置顶：全站置顶出现在主列表和每个话题列表里；话题置顶只出现在该话题列表里。筛选标签 / 搜索时不显示置顶
+      let pinned = [];
+      if (!tag && !q) {
+        const scopes = topic ? ['global', 'topic:' + topic] : ['global'];
+        const { results: pr } = await db.prepare(`SELECT post_id, scope, expires_at FROM pins WHERE scope IN (${scopes.map(() => '?').join(',')}) AND (expires_at IS NULL OR expires_at > ?) ORDER BY (scope = 'global') DESC, created_at DESC`).bind(...scopes, now).all();
+        const seen = new Set(); const ids = [];
+        for (const r of pr) if (!seen.has(r.post_id)) { seen.add(r.post_id); ids.push(r); }
+        if (ids.length) {
+          where.push(`p.id NOT IN (${ids.map(() => '?').join(',')})`); args.push(...ids.map((r) => r.post_id));
+          if (offset === 0) {
+            const rows = await listPosts(db, user, [`p.id IN (${ids.map(() => '?').join(',')})`], ids.map((r) => r.post_id), 'p.id DESC', 50, 0);
+            const by = new Map(rows.map((r) => [r.id, r]));
+            pinned = ids.map((r) => by.get(r.post_id) && { ...by.get(r.post_id), pin_scope: r.scope, pin_expires_at: r.expires_at }).filter(Boolean);
+          }
+        }
+      }
+      const rows = await listPosts(db, user, where, args, `${SORTS[sort]} ${dir}, p.id ${dir}`, LIMITS.PAGE + 1, offset);
+      const posts = rows.slice(0, LIMITS.PAGE);
+      await attachMeta(db, [...posts, ...pinned]);
+      return json({ ok: true, me: user, admin: isAdmin, posts, pinned, hasMore: rows.length > LIMITS.PAGE, sort, dir: dir.toLowerCase() });
     }
 
     case 'post': {
       const id = Number(b.id);
       const post = await db.prepare('SELECT p.*, a.updated_at AS av FROM posts p LEFT JOIN avatars a ON a.username = p.author WHERE p.id = ?1').bind(id).first();
-      if (!post) return fail('帖子不存在或已被删除', 404);
-      const { results } = await db.prepare(`SELECT r.id, r.author, r.body, r.created_at, a.updated_at AS av
+      if (!post) return failc('post_gone', 404);
+      const { results: rrows } = await db.prepare(`SELECT r.id, r.author, r.body, r.created_at, r.parent_id, r.depth, r.reply_to, r.deleted, r.edited_at, a.updated_at AS av,
+                                            (SELECT COUNT(*) FROM reply_likes x WHERE x.reply_id = r.id) AS like_count,
+                                            (SELECT COUNT(*) FROM reply_likes x WHERE x.reply_id = r.id AND x.username = ?3) AS liked
                                             FROM replies r LEFT JOIN avatars a ON a.username = r.author
                                             WHERE r.post_id = ?1 ORDER BY r.id LIMIT ?2`)
-        .bind(id, LIMITS.MAX_REPLIES).all();
+        .bind(id, LIMITS.MAX_REPLIES, user).all();
+      const results = rrows.map((r) => ({ ...r, deleted: !!r.deleted, liked: !!r.liked }));
       const lk = await db.prepare('SELECT COUNT(*) AS n, SUM(username = ?2) AS me FROM likes WHERE post_id = ?1').bind(id, user).first();
       post.like_count = (lk && lk.n) || 0; post.liked = !!(lk && lk.me);
+      await attachMeta(db, [post]);
+      const bm = await db.prepare('SELECT folder_id FROM bookmarks WHERE username = ?1 AND post_id = ?2').bind(user, id).first();
+      const mc = await db.prepare('SELECT COUNT(*) AS n FROM bookmarks WHERE post_id = ?1').bind(id).first();
+      post.marked = !!bm; post.folder_id = bm ? bm.folder_id : null; post.mark_count = mc.n;
+      const { results: pn } = await db.prepare('SELECT scope, expires_at FROM pins WHERE post_id = ?1 AND (expires_at IS NULL OR expires_at > ?2)').bind(id, now).all();
+      post.pins = pn;
+      // 当前用户能在哪些范围置顶这个帖子
+      const opts = [];
+      if (isAdmin) opts.push({ scope: 'global' });
+      for (const t of post.topics) if (isAdmin || t.creator === user) opts.push({ scope: 'topic:' + t.id, name: t.name });
+      post.pin_options = opts;
       return json({ ok: true, me: user, admin: isAdmin, post, replies: results, poll: await loadPoll(db, id, user, now, isAdmin) });
     }
 
@@ -150,6 +207,8 @@ async function route({ request, env, params }) {
       if (title === null) return fail(`标题最多 ${LIMITS.TITLE} 字`);
       if (body === null) return fail(`正文最多 ${LIMITS.POST} 字`);
       if (!title || !body) return fail('标题和正文都不能为空');
+      const meta = await parseMeta(db, b);
+      if (typeof meta === 'string') return failc(meta);
       let poll = null;
       if (b.poll) { poll = parsePoll(b.poll, now); if (typeof poll === 'string') return fail(poll, 400, 'poll_invalid'); }
       if (!isAdmin) {
@@ -159,6 +218,7 @@ async function route({ request, env, params }) {
       const r = await db.prepare('INSERT INTO posts (author, title, body, created_at, last_at, reply_count) VALUES (?1, ?2, ?3, ?4, ?4, 0)')
         .bind(user, title, body, now).run();
       const id = r.meta.last_row_id;
+      if (meta.topics.length || meta.tags.length) await db.batch(metaStmts(db, id, meta, false));
       if (poll) await db.prepare('INSERT INTO polls (post_id, multi, closes_at, options, anon, vis) VALUES (?1, ?2, ?3, ?4, ?5, ?6)').bind(id, poll.multi, poll.closes_at, JSON.stringify(poll.options), poll.anon, poll.vis).run();
       if (id % 20 === 0) {   // 每 20 个帖子顺手清理一次，只留最近活跃的 KEEP_POSTS 个
         await db.batch([
@@ -167,28 +227,77 @@ async function route({ request, env, params }) {
           db.prepare('DELETE FROM likes WHERE post_id NOT IN (SELECT id FROM posts)'),
           db.prepare('DELETE FROM polls WHERE post_id NOT IN (SELECT id FROM posts)'),
           db.prepare('DELETE FROM poll_votes WHERE post_id NOT IN (SELECT id FROM posts)'),
+          db.prepare('DELETE FROM reply_likes WHERE reply_id NOT IN (SELECT id FROM replies)'),
+          db.prepare('DELETE FROM post_topics WHERE post_id NOT IN (SELECT id FROM posts)'),
+          db.prepare('DELETE FROM post_tags WHERE post_id NOT IN (SELECT id FROM posts)'),
+          db.prepare('DELETE FROM pins WHERE post_id NOT IN (SELECT id FROM posts)'),
+          db.prepare('DELETE FROM bookmarks WHERE post_id NOT IN (SELECT id FROM posts)'),
         ]);
       }
       return json({ ok: true, id });
     }
 
-    case 'reply': {
+    case 'reply': {   // 可回复帖子（不传 parent_id）或回复某条评论（最多 3 层，更深的归到第 3 层，并记下回复的是谁）
       const pid = Number(b.post_id);
       const body = clean(b.body, LIMITS.REPLY);
       if (body === null) return fail(`回复最多 ${LIMITS.REPLY} 字`);
       if (!body) return fail('回复内容不能为空');
-      const post = await db.prepare('SELECT id, reply_count FROM posts WHERE id = ?1').bind(pid).first();
-      if (!post) return fail('帖子不存在或已被删除', 404);
-      if (post.reply_count >= LIMITS.MAX_REPLIES) return fail(`这个帖子回复已满（${LIMITS.MAX_REPLIES} 条），请新开一个帖子`);
+      const post = await db.prepare('SELECT id FROM posts WHERE id = ?1').bind(pid).first();
+      if (!post) return failc('post_gone', 404);
+      const rc = await db.prepare('SELECT COUNT(*) AS n FROM replies WHERE post_id = ?1').bind(pid).first();
+      if (rc.n >= LIMITS.MAX_REPLIES) return fail(`这个帖子回复已满（${LIMITS.MAX_REPLIES} 条），请新开一个帖子`);
       if (!isAdmin) {
         const last = await db.prepare('SELECT MAX(created_at) AS t FROM replies WHERE author = ?1').bind(user).first();
         if (last && last.t && now - last.t < LIMITS.REPLY_GAP_MS) return fail('回复得太快啦，稍等几秒', 429);
       }
+      let parent = null, depth = 0, replyTo = null;
+      if (b.parent_id != null) {
+        const par = await db.prepare('SELECT id, post_id, parent_id, depth, author, deleted FROM replies WHERE id = ?1').bind(Number(b.parent_id)).first();
+        if (!par || par.post_id !== pid || par.deleted) return failc('reply_gone', 404);
+        replyTo = par.author;
+        if (par.depth >= LIMITS.MAX_DEPTH) { parent = par.parent_id; depth = LIMITS.MAX_DEPTH; }
+        else { parent = par.id; depth = par.depth + 1; }
+      }
       const res = await db.batch([
-        db.prepare('INSERT INTO replies (post_id, author, body, created_at) VALUES (?1, ?2, ?3, ?4)').bind(pid, user, body, now),
+        db.prepare('INSERT INTO replies (post_id, author, body, created_at, parent_id, depth, reply_to) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)').bind(pid, user, body, now, parent, depth, replyTo),
         db.prepare('UPDATE posts SET reply_count = reply_count + 1, last_at = ?2 WHERE id = ?1').bind(pid, now),
       ]);
       return json({ ok: true, id: res[0].meta.last_row_id });
+    }
+
+    case 'reply_like': {   // 再点一次取消
+      const rid = Number(b.id);
+      const r = await db.prepare('SELECT deleted FROM replies WHERE id = ?1').bind(rid).first();
+      if (!r || r.deleted) return failc('reply_gone', 404);
+      const had = await db.prepare('SELECT 1 AS x FROM reply_likes WHERE reply_id = ?1 AND username = ?2').bind(rid, user).first();
+      if (had) await db.prepare('DELETE FROM reply_likes WHERE reply_id = ?1 AND username = ?2').bind(rid, user).run();
+      else await db.prepare('INSERT OR IGNORE INTO reply_likes (reply_id, username, created_at) VALUES (?1, ?2, ?3)').bind(rid, user, now).run();
+      const n = await db.prepare('SELECT COUNT(*) AS n FROM reply_likes WHERE reply_id = ?1').bind(rid).first();
+      return json({ ok: true, liked: !had, count: n.n });
+    }
+
+    case 'reply_edit': {   // 只有作者能改自己的评论
+      const r = await db.prepare('SELECT author, deleted FROM replies WHERE id = ?1').bind(Number(b.id)).first();
+      if (!r || r.deleted) return failc('reply_gone', 404);
+      if (r.author !== user) return failc('edit_forbidden', 403);
+      const body = clean(b.body, LIMITS.REPLY);
+      if (body === null) return fail(`回复最多 ${LIMITS.REPLY} 字`);
+      if (!body) return fail('回复内容不能为空');
+      await db.prepare('UPDATE replies SET body = ?2, edited_at = ?3 WHERE id = ?1').bind(Number(b.id), body, now).run();
+      return json({ ok: true, edited_at: now });
+    }
+
+    case 'post_edit': {   // 只有作者能改自己的帖子标题和正文
+      const post = await db.prepare('SELECT author FROM posts WHERE id = ?1').bind(Number(b.id)).first();
+      if (!post) return failc('post_gone', 404);
+      if (post.author !== user) return failc('edit_forbidden', 403);
+      const title = clean(String(b.title || '').replace(/\s+/g, ' '), LIMITS.TITLE);
+      const body = clean(b.body, LIMITS.POST);
+      if (title === null) return fail(`标题最多 ${LIMITS.TITLE} 字`);
+      if (body === null) return fail(`正文最多 ${LIMITS.POST} 字`);
+      if (!title || !body) return fail('标题和正文都不能为空');
+      await db.prepare('UPDATE posts SET title = ?2, body = ?3, edited_at = ?4 WHERE id = ?1').bind(Number(b.id), title, body, now).run();
+      return json({ ok: true, edited_at: now });
     }
 
     case 'delete': {   // 自己的帖子/回复可删；管理员可删任何人的
@@ -198,22 +307,24 @@ async function route({ request, env, params }) {
         if (!p) return json({ ok: true });
         if (p.author !== user && !isAdmin) return fail('只能删除自己的帖子', 403);
         await db.batch([
+          db.prepare('DELETE FROM reply_likes WHERE reply_id IN (SELECT id FROM replies WHERE post_id = ?1)').bind(id),
           db.prepare('DELETE FROM replies WHERE post_id = ?1').bind(id),
           db.prepare('DELETE FROM likes WHERE post_id = ?1').bind(id),
           db.prepare('DELETE FROM poll_votes WHERE post_id = ?1').bind(id),
           db.prepare('DELETE FROM polls WHERE post_id = ?1').bind(id),
+          db.prepare('DELETE FROM post_topics WHERE post_id = ?1').bind(id),
+          db.prepare('DELETE FROM post_tags WHERE post_id = ?1').bind(id),
+          db.prepare('DELETE FROM pins WHERE post_id = ?1').bind(id),
+          db.prepare('DELETE FROM bookmarks WHERE post_id = ?1').bind(id),
           db.prepare('DELETE FROM posts WHERE id = ?1').bind(id),
         ]);
         return json({ ok: true });
       }
-      if (b.type === 'reply') {
-        const r = await db.prepare('SELECT author, post_id FROM replies WHERE id = ?1').bind(id).first();
-        if (!r) return json({ ok: true });
+      if (b.type === 'reply') {   // 有人回复过的评论：内容清空、留「已删除」占位；没人回复的直接删除
+        const r = await db.prepare('SELECT author, deleted FROM replies WHERE id = ?1').bind(id).first();
+        if (!r || r.deleted) return json({ ok: true });
         if (r.author !== user && !isAdmin) return fail('只能删除自己的回复', 403);
-        await db.batch([
-          db.prepare('DELETE FROM replies WHERE id = ?1').bind(id),
-          db.prepare('UPDATE posts SET reply_count = MAX(reply_count - 1, 0) WHERE id = ?1').bind(r.post_id),
-        ]);
+        await removeReply(db, id);
         return json({ ok: true });
       }
       return fail('参数错误');
@@ -223,7 +334,7 @@ async function route({ request, env, params }) {
     case 'like': {
       const pid = Number(b.post_id);
       const post = await db.prepare('SELECT id FROM posts WHERE id = ?1').bind(pid).first();
-      if (!post) return fail('帖子不存在或已被删除', 404);
+      if (!post) return failc('post_gone', 404);
       const had = await db.prepare('SELECT 1 AS x FROM likes WHERE post_id = ?1 AND username = ?2').bind(pid, user).first();
       if (had) await db.prepare('DELETE FROM likes WHERE post_id = ?1 AND username = ?2').bind(pid, user).run();
       else await db.prepare('INSERT OR IGNORE INTO likes (post_id, username, created_at) VALUES (?1, ?2, ?3)').bind(pid, user, now).run();
@@ -365,6 +476,152 @@ async function route({ request, env, params }) {
       return json({ ok: true });
     }
 
+    // ---------- 话题（板块）：所有人可建；创建者或管理员可删；管理员可合并 ----------
+    case 'topic_list': {
+      const { results } = await db.prepare(`SELECT t.id, t.name, t.descr, t.creator, t.created_at,
+                                                    (SELECT COUNT(*) FROM post_topics pt WHERE pt.topic_id = t.id) AS post_count
+                                             FROM topics t ORDER BY post_count DESC, t.id LIMIT ?1`).bind(LIMITS.TOPICS_MAX).all();
+      return json({ ok: true, me: user, admin: isAdmin, topics: results });
+    }
+    case 'topic_create': {
+      const name = clean(String(b.name || '').replace(/\s+/g, ' ').replace(/^#+/, ''), LIMITS.TOPIC_NAME);
+      const descr = clean(b.descr, LIMITS.TOPIC_DESC);
+      if (!name) return failc('topic_name');
+      if (descr === null) return failc('topic_desc');
+      const dup = await db.prepare('SELECT id FROM topics WHERE name = ?1').bind(name).first();
+      if (dup) return failc('topic_exists', 400, { id: dup.id });
+      const cnt = await db.prepare('SELECT COUNT(*) AS n FROM topics').first();
+      if (cnt.n >= LIMITS.TOPICS_MAX) return failc('topic_many');
+      if (!isAdmin) {
+        const last = await db.prepare('SELECT MAX(created_at) AS t FROM topics WHERE creator = ?1').bind(user).first();
+        if (last && last.t && now - last.t < LIMITS.TOPIC_GAP_MS) return fail('操作太快啦，稍等几秒再试', 429, 'too_fast');
+      }
+      const r = await db.prepare('INSERT INTO topics (name, descr, creator, created_at) VALUES (?1, ?2, ?3, ?4)').bind(name, descr || '', user, now).run();
+      return json({ ok: true, id: r.meta.last_row_id });
+    }
+    case 'topic_delete': {
+      const id = Number(b.id);
+      const t = await db.prepare('SELECT creator FROM topics WHERE id = ?1').bind(id).first();
+      if (!t) return json({ ok: true });
+      if (t.creator !== user && !isAdmin) return failc('topic_forbidden', 403);
+      await db.batch([
+        db.prepare('DELETE FROM post_topics WHERE topic_id = ?1').bind(id),
+        db.prepare('DELETE FROM pins WHERE scope = ?1').bind('topic:' + id),
+        db.prepare('DELETE FROM topics WHERE id = ?1').bind(id),
+      ]);
+      return json({ ok: true });
+    }
+    case 'topic_merge': {   // 把 from 并入 into（管理员）
+      if (!isAdmin) return failc('admin_only', 403);
+      const from = Number(b.from), into = Number(b.into);
+      if (!from || !into || from === into) return failc('topic_gone');
+      const x = await db.prepare('SELECT COUNT(*) AS n FROM topics WHERE id IN (?1, ?2)').bind(from, into).first();
+      if (x.n !== 2) return failc('topic_gone', 404);
+      await db.batch([
+        db.prepare('INSERT OR IGNORE INTO post_topics (post_id, topic_id) SELECT post_id, ?2 FROM post_topics WHERE topic_id = ?1').bind(from, into),
+        db.prepare('DELETE FROM post_topics WHERE topic_id = ?1').bind(from),
+        db.prepare('UPDATE OR IGNORE pins SET scope = ?2 WHERE scope = ?1').bind('topic:' + from, 'topic:' + into),
+        db.prepare('DELETE FROM pins WHERE scope = ?1').bind('topic:' + from),
+        db.prepare('DELETE FROM topics WHERE id = ?1').bind(from),
+      ]);
+      return json({ ok: true });
+    }
+
+    // 修改帖子的话题 / 标签（作者或管理员）
+    case 'post_meta': {
+      const id = Number(b.id);
+      const post = await db.prepare('SELECT author FROM posts WHERE id = ?1').bind(id).first();
+      if (!post) return failc('post_gone', 404);
+      if (post.author !== user && !isAdmin) return fail('只能修改自己的帖子', 403);
+      const meta = await parseMeta(db, b);
+      if (typeof meta === 'string') return failc(meta);
+      await db.batch(metaStmts(db, id, meta, true));
+      return json({ ok: true });
+    }
+
+    // ---------- 置顶：管理员可全站置顶；话题创建者可在自己的话题里置顶；每个范围最多 PIN_MAX 条，可设有效期 ----------
+    case 'pin': {
+      const pid = Number(b.post_id);
+      const scope = String(b.scope || '');
+      const post = await db.prepare('SELECT id FROM posts WHERE id = ?1').bind(pid).first();
+      if (!post) return failc('post_gone', 404);
+      if (scope === 'global') { if (!isAdmin) return failc('pin_forbidden', 403); }
+      else {
+        const m = /^topic:(\d+)$/.exec(scope);
+        if (!m) return failc('pin_scope');
+        const tp = await db.prepare('SELECT creator FROM topics WHERE id = ?1').bind(Number(m[1])).first();
+        if (!tp) return failc('topic_gone', 404);
+        if (!isAdmin && tp.creator !== user) return failc('pin_forbidden', 403);
+        const inT = await db.prepare('SELECT 1 AS x FROM post_topics WHERE post_id = ?1 AND topic_id = ?2').bind(pid, Number(m[1])).first();
+        if (!inT) return failc('pin_scope');
+      }
+      if (b.on === false) { await db.prepare('DELETE FROM pins WHERE scope = ?1 AND post_id = ?2').bind(scope, pid).run(); return json({ ok: true }); }
+      const c = await db.prepare('SELECT COUNT(*) AS n FROM pins WHERE scope = ?1 AND post_id != ?2 AND (expires_at IS NULL OR expires_at > ?3)').bind(scope, pid, now).first();
+      if (c.n >= LIMITS.PIN_MAX) return failc('pin_full');
+      const hrs = Number(b.hours);
+      const exp = hrs > 0 ? now + Math.min(hrs, 24 * 365) * 3600000 : null;
+      await db.prepare('INSERT OR REPLACE INTO pins (scope, post_id, created_at, expires_at, by) VALUES (?1, ?2, ?3, ?4, ?5)').bind(scope, pid, now, exp, user).run();
+      return json({ ok: true });
+    }
+
+    // ---------- 收藏（私人）：可放进自己的收藏夹 ----------
+    case 'bookmark': {
+      const pid = Number(b.post_id);
+      const post = await db.prepare('SELECT id FROM posts WHERE id = ?1').bind(pid).first();
+      if (!post) return failc('post_gone', 404);
+      if (b.on === false) await db.prepare('DELETE FROM bookmarks WHERE username = ?1 AND post_id = ?2').bind(user, pid).run();
+      else {
+        let fid = null;
+        if (b.folder_id != null) {
+          fid = Number(b.folder_id);
+          const f = await db.prepare('SELECT 1 AS x FROM bookmark_folders WHERE id = ?1 AND username = ?2').bind(fid, user).first();
+          if (!f) return failc('folder_gone', 404);
+        }
+        await db.prepare('INSERT INTO bookmarks (username, post_id, folder_id, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(username, post_id) DO UPDATE SET folder_id = ?3').bind(user, pid, fid, now).run();
+      }
+      const bm = await db.prepare('SELECT folder_id FROM bookmarks WHERE username = ?1 AND post_id = ?2').bind(user, pid).first();
+      const mc = await db.prepare('SELECT COUNT(*) AS n FROM bookmarks WHERE post_id = ?1').bind(pid).first();
+      return json({ ok: true, marked: !!bm, folder_id: bm ? bm.folder_id : null, count: mc.n });
+    }
+    case 'folder_list': {
+      const { results } = await db.prepare(`SELECT f.id, f.name, (SELECT COUNT(*) FROM bookmarks k WHERE k.username = f.username AND k.folder_id = f.id) AS n
+                                             FROM bookmark_folders f WHERE f.username = ?1 ORDER BY f.id`).bind(user).all();
+      const tot = await db.prepare('SELECT COUNT(*) AS n, SUM(folder_id IS NULL) AS u FROM bookmarks WHERE username = ?1').bind(user).first();
+      return json({ ok: true, folders: results, total: tot.n || 0, unfiled: tot.u || 0 });
+    }
+    case 'folder_create': {
+      const name = clean(String(b.name || '').replace(/\s+/g, ' '), LIMITS.FOLDER_NAME);
+      if (!name) return failc('folder_name');
+      const c = await db.prepare('SELECT COUNT(*) AS n FROM bookmark_folders WHERE username = ?1').bind(user).first();
+      if (c.n >= LIMITS.FOLDERS_MAX) return failc('folder_many');
+      const r = await db.prepare('INSERT INTO bookmark_folders (username, name, created_at) VALUES (?1, ?2, ?3)').bind(user, name, now).run();
+      return json({ ok: true, id: r.meta.last_row_id });
+    }
+    case 'folder_rename': {
+      const name = clean(String(b.name || '').replace(/\s+/g, ' '), LIMITS.FOLDER_NAME);
+      if (!name) return failc('folder_name');
+      await db.prepare('UPDATE bookmark_folders SET name = ?3 WHERE id = ?1 AND username = ?2').bind(Number(b.id), user, name).run();
+      return json({ ok: true });
+    }
+    case 'folder_delete': {   // 夹里的收藏不会丢，回到「未分类」
+      const id = Number(b.id);
+      await db.batch([
+        db.prepare('UPDATE bookmarks SET folder_id = NULL WHERE username = ?1 AND folder_id = ?2').bind(user, id),
+        db.prepare('DELETE FROM bookmark_folders WHERE id = ?1 AND username = ?2').bind(id, user),
+      ]);
+      return json({ ok: true });
+    }
+    case 'bookmark_list': {   // folder: 不传 = 全部；'none' = 未分类；数字 = 某个收藏夹
+      const offset = Math.max(0, Math.floor(Number(b.offset)) || 0);
+      const where = ['p.id IN (SELECT post_id FROM bookmarks WHERE username = ?' + (b.folder === 'none' ? ' AND folder_id IS NULL' : Number(b.folder) > 0 ? ' AND folder_id = ?' : '') + ')'];
+      const args = [user];
+      if (b.folder !== 'none' && Number(b.folder) > 0) args.push(Number(b.folder));
+      const rows = await listPosts(db, user, where, args, '(SELECT created_at FROM bookmarks k2 WHERE k2.username = ? AND k2.post_id = p.id) DESC', LIMITS.MARK_PAGE + 1, offset, [user]);
+      const posts = rows.slice(0, LIMITS.MARK_PAGE);
+      await attachMeta(db, posts);
+      return json({ ok: true, me: user, posts, hasMore: rows.length > LIMITS.MARK_PAGE });
+    }
+
     // ---------- 管理员专用 ----------
     case 'admin_users': {
       if (!isAdmin) return fail('需要管理员权限', 403);
@@ -402,6 +659,91 @@ async function route({ request, env, params }) {
   }
 }
 
+// ---------- 辅助：评论删除 ----------
+// 有子评论 → 软删除（留占位，保证下面的回复还在）；没有 → 真删；删完再顺着往上清掉已经没有子评论的占位
+async function removeReply(db, id) {
+  const r = await db.prepare('SELECT post_id, parent_id FROM replies WHERE id = ?1').bind(id).first();
+  if (!r) return;
+  const kids = await db.prepare('SELECT COUNT(*) AS n FROM replies WHERE parent_id = ?1').bind(id).first();
+  if (kids.n > 0) {
+    await db.batch([
+      db.prepare("UPDATE replies SET deleted = 1, body = '', author = '' WHERE id = ?1").bind(id),
+      db.prepare('DELETE FROM reply_likes WHERE reply_id = ?1').bind(id),
+      db.prepare('UPDATE posts SET reply_count = MAX(reply_count - 1, 0) WHERE id = ?1').bind(r.post_id),
+    ]);
+    return;
+  }
+  await db.batch([
+    db.prepare('DELETE FROM replies WHERE id = ?1').bind(id),
+    db.prepare('DELETE FROM reply_likes WHERE reply_id = ?1').bind(id),
+    db.prepare('UPDATE posts SET reply_count = MAX(reply_count - 1, 0) WHERE id = ?1').bind(r.post_id),
+  ]);
+  let pid = r.parent_id;
+  while (pid) {
+    const p = await db.prepare('SELECT parent_id, deleted FROM replies WHERE id = ?1').bind(pid).first();
+    if (!p || !p.deleted) break;
+    const k = await db.prepare('SELECT COUNT(*) AS n FROM replies WHERE parent_id = ?1').bind(pid).first();
+    if (k.n > 0) break;
+    await db.prepare('DELETE FROM replies WHERE id = ?1').bind(pid).run();
+    pid = p.parent_id;
+  }
+}
+
+// ---------- 辅助：话题 / 标签 / 列表 ----------
+// 帖子列表的统一查询。where / args 是筛选条件；orderArgs 是 order 里用到的参数（在 limit 之前绑定）
+async function listPosts(db, user, where, args, order, limit, offset, orderArgs) {
+  const sql = `SELECT p.id, p.author, p.title, substr(p.body, 1, 80) AS snippet, p.created_at, p.last_at, p.reply_count, a.updated_at AS av,
+                      (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
+                      (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id AND l.username = ?) AS liked,
+                      (SELECT COUNT(*) FROM bookmarks k WHERE k.post_id = p.id) AS mark_count,
+                      (SELECT COUNT(*) FROM bookmarks k WHERE k.post_id = p.id AND k.username = ?) AS marked,
+                      (SELECT COUNT(*) FROM polls o WHERE o.post_id = p.id) AS has_poll
+               FROM posts p LEFT JOIN avatars a ON a.username = p.author
+               ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+               ORDER BY ${order} LIMIT ? OFFSET ?`;
+  const { results } = await db.prepare(sql).bind(user, user, ...args, ...(orderArgs || []), limit, offset).all();
+  return results.map((r) => ({ ...r, liked: !!r.liked, marked: !!r.marked, has_poll: !!r.has_poll }));
+}
+// 给帖子数组补上 topics: [{id,name,creator}] 和 tags: [..]
+async function attachMeta(db, posts) {
+  if (!posts.length) return;
+  const ids = posts.map((p) => p.id), ph = ids.map(() => '?').join(',');
+  const { results: tr } = await db.prepare(`SELECT pt.post_id, t.id, t.name, t.creator FROM post_topics pt JOIN topics t ON t.id = pt.topic_id WHERE pt.post_id IN (${ph}) ORDER BY t.id`).bind(...ids).all();
+  const { results: gr } = await db.prepare(`SELECT post_id, tag FROM post_tags WHERE post_id IN (${ph}) ORDER BY rowid`).bind(...ids).all();
+  for (const p of posts) { p.topics = []; p.tags = []; }
+  const by = new Map(posts.map((p) => [p.id, p]));
+  for (const r of tr) by.get(r.post_id).topics.push({ id: r.id, name: r.name, creator: r.creator });
+  for (const r of gr) by.get(r.post_id).tags.push(r.tag);
+}
+// 校验发帖 / 改帖时的话题和标签，出错返回错误码字符串
+async function parseMeta(db, b) {
+  const topics = Array.isArray(b.topics) ? [...new Set(b.topics.map(Number).filter((x) => Number.isInteger(x) && x > 0))] : [];
+  if (topics.length > LIMITS.TOPICS_PER_POST) return 'topics_many';
+  if (topics.length) {
+    const { results } = await db.prepare(`SELECT id FROM topics WHERE id IN (${topics.map(() => '?').join(',')})`).bind(...topics).all();
+    if (results.length !== topics.length) return 'topic_gone';
+  }
+  const tags = [];
+  for (const raw of Array.isArray(b.tags) ? b.tags : []) {
+    const t = clean(String(raw == null ? '' : raw).replace(/^#+/, '').replace(/\s+/g, ' '), LIMITS.TAG_LEN);
+    if (t === null) return 'tag_len';
+    if (t && !tags.some((x) => x.toLowerCase() === t.toLowerCase())) tags.push(t);
+  }
+  if (tags.length > LIMITS.TAGS_PER_POST) return 'tags_many';
+  return { topics, tags };
+}
+function metaStmts(db, pid, meta, replace) {
+  const out = [];
+  if (replace) {
+    out.push(db.prepare('DELETE FROM post_topics WHERE post_id = ?1').bind(pid), db.prepare('DELETE FROM post_tags WHERE post_id = ?1').bind(pid));
+    // 帖子不再属于的话题，对应的话题置顶也撤掉
+    out.push(db.prepare(`DELETE FROM pins WHERE post_id = ?1 AND scope != 'global'`).bind(pid));
+  }
+  for (const t of meta.topics) out.push(db.prepare('INSERT OR IGNORE INTO post_topics (post_id, topic_id) VALUES (?1, ?2)').bind(pid, t));
+  for (const g of meta.tags) out.push(db.prepare('INSERT OR IGNORE INTO post_tags (post_id, tag) VALUES (?1, ?2)').bind(pid, g));
+  return out;
+}
+
 // ---------- 辅助：投票 / 问卷 ----------
 // 注销账号时要一起清掉的新数据：他的点赞、投票、问卷答卷、他发的问卷，以及他的帖子上的点赞 / 投票
 // （同样的清理在 functions/api/[action].js 的 purgeForum 里也有一份，改这里时记得同步）
@@ -410,6 +752,14 @@ function userContentCleanup(db, u) {
     db.prepare('DELETE FROM likes WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
     db.prepare('DELETE FROM poll_votes WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
     db.prepare('DELETE FROM polls WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
+    db.prepare('DELETE FROM reply_likes WHERE reply_id IN (SELECT id FROM replies WHERE author = ?1 OR post_id IN (SELECT id FROM posts WHERE author = ?1))').bind(u),
+    db.prepare('DELETE FROM reply_likes WHERE username = ?1').bind(u),
+    db.prepare('DELETE FROM post_topics WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
+    db.prepare('DELETE FROM post_tags WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
+    db.prepare('DELETE FROM pins WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
+    db.prepare('DELETE FROM bookmarks WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
+    db.prepare('DELETE FROM bookmarks WHERE username = ?1').bind(u),
+    db.prepare('DELETE FROM bookmark_folders WHERE username = ?1').bind(u),
     db.prepare('DELETE FROM likes WHERE username = ?1').bind(u),
     db.prepare('DELETE FROM poll_votes WHERE username = ?1').bind(u),
     db.prepare('DELETE FROM survey_responses WHERE username = ?1').bind(u),
