@@ -299,6 +299,16 @@ async function route({ request, env, params }) {
 
 // 删除某用户在论坛的全部内容（帖子连同帖子下的回复，以及他在别人帖子下的回复）
 async function purgeForum(db, username) {
+  // 网盘：GitHub 上的文件进清理队列，由论坛接口慢慢删；表还没建就忽略
+  try {
+    await db.batch([
+      db.prepare('INSERT INTO drive_gc (repo, path, sha) SELECT repo, path, sha FROM drive_files WHERE owner = ?1').bind(username),
+      db.prepare('DELETE FROM drive_att WHERE file_id IN (SELECT id FROM drive_files WHERE owner = ?1)').bind(username),
+      db.prepare('DELETE FROM drive_shares WHERE to_user = ?1 OR file_id IN (SELECT id FROM drive_files WHERE owner = ?1)').bind(username),
+      db.prepare('DELETE FROM drive_files WHERE owner = ?1').bind(username),
+      db.prepare('DELETE FROM drive_folders WHERE owner = ?1').bind(username),
+    ]);
+  } catch (e) {}
   // 新功能的表（点赞 / 投票 / 问卷）可能还没建，单独执行并忽略错误，不影响下面老的清理
   try {
     await db.batch([

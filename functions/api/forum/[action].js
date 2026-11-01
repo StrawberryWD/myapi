@@ -5,8 +5,9 @@
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Drive',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Expose-Headers': 'Content-Disposition',
 };
 const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', ...cors } });
@@ -18,7 +19,6 @@ const LIMITS = {
   TITLE: 60,           // 标题最多字数
   POST: 2000,          // 帖子正文最多字数
   REPLY: 300,          // 单条回复最多字数
-  KEEP_POSTS: 2000,    // 最多保留的帖子数，超出自动删掉最久没动静的
   MAX_REPLIES: 100,    // 每个帖子最多回复条数
   POST_GAP_MS: 20000,  // 同一用户两次发帖最小间隔
   REPLY_GAP_MS: 5000,  // 同一用户两次回复最小间隔
@@ -35,6 +35,10 @@ const LIMITS = {
   MAX_DEPTH: 2,        // 评论嵌套：0 / 1 / 2 共 3 层，更深的回复归到第 3 层
   FOLDER_NAME: 20, FOLDERS_MAX: 20, MARK_PAGE: 20,   // 收藏夹
   TOPIC_GAP_MS: 10000, // 同一用户两次建话题最小间隔
+  // 2901网盘
+  DRIVE_QUOTA: 500 * 1024 * 1024, DRIVE_FILE_MAX: 25 * 1024 * 1024, IMG_QUOTA: 100 * 1024 * 1024, IMG_MAX: 2 * 1024 * 1024, IMG_DAILY: 40, UP_DAILY: 100,
+  REPO_SOFT: 800 * 1024 * 1024, DRIVE_NAME: 80, DFOLDER_NAME: 30, DFOLDERS_MAX: 100, DFOLDER_DEPTH: 3, DRIVE_PAGE: 50, SHARE_USERS_MAX: 20,
+  ATT_POST_IMGS: 9, ATT_POST_FILES: 5, ATT_DM: 1, ORPHAN_MS: 2 * 3600 * 1000,
 };
 const EMSG = {
   topics_many: '每个帖子最多选 3 个话题', tags_many: '每个帖子最多 5 个标签', tag_len: '标签最多 20 字', topic_gone: '话题不存在',
@@ -45,6 +49,10 @@ const EMSG = {
   user_gone: '用户不存在', follow_self: '不能关注自己', private: '对方没有公开这部分内容', bio_len: '简介最多 200 字',
   dm_self: '不能给自己发私信', dm_blocked: '无法给对方发送私信', dm_you_blocked: '你已拉黑对方，先取消拉黑才能发私信', dm_empty: '消息不能为空', dm_len: '消息最多 500 字',
   dm_limit: '今天发的私信太多了，明天再试', dm_gone: '消息不存在', dm_recall_time: '只能撤回 10 分钟内的消息', report_none: '请选择要举报的消息', report_many: '今天举报次数太多了', report_gone: '举报不存在',
+  drive_off: '网盘还没有配置存储仓库', drive_gone: '文件不存在或没有权限', drive_quota: '网盘空间不足', drive_big: '文件太大', drive_limit: '今天上传太多了，明天再试',
+  drive_full: '存储仓库已满，请联系管理员', drive_name: '请填写名称', drive_dup: '已有同名文件夹', drive_depth: '文件夹最多 3 层', drive_folders_many: '文件夹数量已达上限',
+  drive_folder_gone: '文件夹不存在', drive_not_empty: '文件夹不是空的', drive_bad: '文件格式不对', drive_busy: '存储繁忙，请重试', drive_upstream: '存储服务出错，请稍后再试',
+  att_gone: '附件不存在', att_many: '附件数量超出限制', share_many: '最多分享给 20 个人',
 };
 const failc = (code, status = 400, extra) => json({ ok: false, error: EMSG[code] || code, code, ...(extra || {}) }, status);
 
@@ -77,6 +85,17 @@ const SCHEMA = [
   'CREATE TABLE IF NOT EXISTS dm_msgs (id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id INTEGER NOT NULL, sender TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL, recalled INTEGER NOT NULL DEFAULT 0)',
   'CREATE INDEX IF NOT EXISTS idx_dm_msgs_conv ON dm_msgs (conv_id, id)',
   'CREATE INDEX IF NOT EXISTS idx_dm_msgs_sender ON dm_msgs (sender, created_at)',
+  // 2901网盘：文件内容在 GitHub 私有仓库里（路径随机），这里只存元数据；kind=img 是帖子 / 私信里的图片（不占网盘空间、不出现在网盘列表）
+  'CREATE TABLE IF NOT EXISTS drive_folders (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, name TEXT NOT NULL, parent INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)',
+  'CREATE INDEX IF NOT EXISTS idx_dfolders_owner ON drive_folders (owner, parent)',
+  "CREATE TABLE IF NOT EXISTS drive_files (id TEXT PRIMARY KEY, owner TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'file', name TEXT NOT NULL, folder INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL, mime TEXT NOT NULL, repo TEXT NOT NULL, path TEXT NOT NULL, sha TEXT NOT NULL, share_all INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)",
+  'CREATE INDEX IF NOT EXISTS idx_dfiles_owner ON drive_files (owner, kind, folder, created_at)',
+  'CREATE INDEX IF NOT EXISTS idx_dfiles_all ON drive_files (share_all, created_at)',
+  'CREATE TABLE IF NOT EXISTS drive_shares (file_id TEXT NOT NULL, to_user TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (file_id, to_user))',
+  'CREATE INDEX IF NOT EXISTS idx_dshares_to ON drive_shares (to_user, created_at)',
+  'CREATE TABLE IF NOT EXISTS drive_att (file_id TEXT NOT NULL, kind TEXT NOT NULL, ref INTEGER NOT NULL, PRIMARY KEY (file_id, kind, ref))',
+  'CREATE INDEX IF NOT EXISTS idx_datt_ref ON drive_att (kind, ref)',
+  'CREATE TABLE IF NOT EXISTS drive_gc (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, path TEXT NOT NULL, sha TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0)',
   'CREATE TABLE IF NOT EXISTS blocks (blocker TEXT NOT NULL, blocked TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (blocker, blocked))',
   'CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks (blocked)',
   // 举报：举报时只保存被举报的那几条消息的快照，管理员只能看到这些
@@ -146,6 +165,7 @@ export async function onRequestPost(ctx) {
 async function route({ request, env, params }) {
   const db = env.DB;
   if (!db) return fail('数据库未绑定（Settings → Bindings，变量名 DB）', 500);
+  if (params.action === 'drive_upload') return driveUpload(request, env);   // 上传走原始 base64 正文 + X-Drive 头，不经过 JSON 解析
   const b = await request.json().catch(() => ({}));
 
   const sess = b.token
@@ -219,6 +239,7 @@ async function route({ request, env, params }) {
       if (isAdmin) opts.push({ scope: 'global' });
       for (const t of post.topics) if (isAdmin || t.creator === user) opts.push({ scope: 'topic:' + t.id, name: t.name });
       post.pin_options = opts;
+      post.atts = (await loadAtts(db, 'post', [id])).get(id) || [];
       return json({ ok: true, me: user, admin: isAdmin, post, replies: results, poll: await loadPoll(db, id, user, now, isAdmin) });
     }
 
@@ -232,6 +253,8 @@ async function route({ request, env, params }) {
       if (typeof meta === 'string') return failc(meta);
       let poll = null;
       if (b.poll) { poll = parsePoll(b.poll, now); if (typeof poll === 'string') return fail(poll, 400, 'poll_invalid'); }
+      let attRows = [];
+      if (Array.isArray(b.att) && b.att.length) { const v = await validateAtt(db, user, b.att, 'post'); if (typeof v === 'string') return failc(v); attRows = v; }
       if (!isAdmin) {
         const last = await db.prepare('SELECT MAX(created_at) AS t FROM posts WHERE author = ?1').bind(user).first();
         if (last && last.t && now - last.t < LIMITS.POST_GAP_MS) return fail('发得太快啦，稍等几秒再发', 429);
@@ -240,21 +263,8 @@ async function route({ request, env, params }) {
         .bind(user, title, body, now).run();
       const id = r.meta.last_row_id;
       if (meta.topics.length || meta.tags.length) await db.batch(metaStmts(db, id, meta, false));
+      if (attRows.length) await db.batch(attRows.map((f) => db.prepare("INSERT OR IGNORE INTO drive_att (file_id, kind, ref) VALUES (?1, 'post', ?2)").bind(f.id, id)));
       if (poll) await db.prepare('INSERT INTO polls (post_id, multi, closes_at, options, anon, vis) VALUES (?1, ?2, ?3, ?4, ?5, ?6)').bind(id, poll.multi, poll.closes_at, JSON.stringify(poll.options), poll.anon, poll.vis).run();
-      if (id % 20 === 0) {   // 每 20 个帖子顺手清理一次，只留最近活跃的 KEEP_POSTS 个
-        await db.batch([
-          db.prepare('DELETE FROM posts WHERE id IN (SELECT id FROM posts ORDER BY last_at DESC, id DESC LIMIT -1 OFFSET ?1)').bind(LIMITS.KEEP_POSTS),
-          db.prepare('DELETE FROM replies WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM likes WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM polls WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM poll_votes WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM reply_likes WHERE reply_id NOT IN (SELECT id FROM replies)'),
-          db.prepare('DELETE FROM post_topics WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM post_tags WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM pins WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM bookmarks WHERE post_id NOT IN (SELECT id FROM posts)'),
-        ]);
-      }
       return json({ ok: true, id });
     }
 
@@ -327,6 +337,7 @@ async function route({ request, env, params }) {
         const p = await db.prepare('SELECT author FROM posts WHERE id = ?1').bind(id).first();
         if (!p) return json({ ok: true });
         if (p.author !== user && !isAdmin) return fail('只能删除自己的帖子', 403);
+        await dropAtts(db, 'post', id);
         await db.batch([
           db.prepare('DELETE FROM reply_likes WHERE reply_id IN (SELECT id FROM replies WHERE post_id = ?1)').bind(id),
           db.prepare('DELETE FROM replies WHERE post_id = ?1').bind(id),
@@ -664,6 +675,7 @@ async function route({ request, env, params }) {
         following: await n('SELECT COUNT(*) AS n FROM follows WHERE follower = ?1', u.username),
         followed_by_me: !me && !!(await n('SELECT COUNT(*) AS n FROM follows WHERE follower = ?1 AND followee = ?2', user, u.username)),
         follows_me: !me && !!(await n('SELECT COUNT(*) AS n FROM follows WHERE follower = ?2 AND followee = ?1', user, u.username)),
+        i_blocked: !me && !!(await n('SELECT COUNT(*) AS n FROM blocks WHERE blocker = ?1 AND blocked = ?2', user, u.username)),
         can: { posts: me || !!pf.show_posts, comments: me || !!pf.show_comments, likes: me || !!pf.show_likes, marks: me || !!pf.show_marks, follows: me || !!pf.show_follows },
       };
       if (me) out.privacy = { show_posts: !!pf.show_posts, show_comments: !!pf.show_comments, show_likes: !!pf.show_likes, show_marks: !!pf.show_marks, show_follows: !!pf.show_follows };
@@ -752,7 +764,10 @@ async function route({ request, env, params }) {
       if (!ex) return failc('user_gone', 404);
       const body = clean(b.body, LIMITS.DM_LEN);
       if (body === null) return failc('dm_len');
-      if (!body) return failc('dm_empty');
+      const attIds = Array.isArray(b.att) ? b.att : [];
+      if (!body && !attIds.length) return failc('dm_empty');
+      let attRows = [];
+      if (attIds.length) { const v = await validateAtt(db, user, attIds, 'dm'); if (typeof v === 'string') return failc(v); attRows = v; }
       if (await db.prepare('SELECT 1 AS x FROM blocks WHERE blocker = ?1 AND blocked = ?2').bind(to, user).first()) return failc('dm_blocked', 403);
       if (await db.prepare('SELECT 1 AS x FROM blocks WHERE blocker = ?1 AND blocked = ?2').bind(user, to).first()) return failc('dm_you_blocked', 403);
       const lastMsg = await db.prepare('SELECT MAX(created_at) AS t FROM dm_msgs WHERE sender = ?1').bind(user).first();
@@ -762,6 +777,7 @@ async function route({ request, env, params }) {
       const conv = await getConv(db, user, to, true);
       const r = await db.prepare('INSERT INTO dm_msgs (conv_id, sender, body, created_at) VALUES (?1, ?2, ?3, ?4)').bind(conv.id, user, body, now).run();
       const mid = r.meta.last_row_id;
+      if (attRows.length) await db.batch(attRows.map((f) => db.prepare("INSERT OR IGNORE INTO drive_att (file_id, kind, ref) VALUES (?1, 'dm', ?2)").bind(f.id, mid)));
       await db.prepare(`UPDATE dm_convs SET last_at = ?2, ${conv.user_a === user ? 'a_read' : 'b_read'} = ?3 WHERE id = ?1`).bind(conv.id, now, mid).run();
       return json({ ok: true, id: mid, created_at: now });
     }
@@ -806,10 +822,11 @@ async function route({ request, env, params }) {
       if (!after && rows.length > LIMITS.DM_PAGE) { hasMore = true; rows = rows.slice(1); }
       const maxId = rows.length ? rows[rows.length - 1].id : 0;
       if (maxId && !before) await db.prepare(`UPDATE dm_convs SET ${meA ? 'a_read' : 'b_read'} = MAX(${meA ? 'a_read' : 'b_read'}, ?2) WHERE id = ?1`).bind(conv.id, maxId).run();
+      const atts = await loadAtts(db, 'dm', rows.map((m) => m.id));
       return json({
         ok: true, me: user, peer: { username: peerInfo.username, av: peerInfo.av }, i_blocked: iBlocked, hasMore,
         peer_read: meA ? conv.b_read : conv.a_read,
-        messages: rows.map((m) => ({ id: m.id, mine: m.sender === user, body: m.recalled ? '' : m.body, recalled: !!m.recalled, created_at: m.created_at })),
+        messages: rows.map((m) => ({ id: m.id, mine: m.sender === user, body: m.recalled ? '' : m.body, recalled: !!m.recalled, created_at: m.created_at, atts: m.recalled ? [] : (atts.get(m.id) || []) })),
       });
     }
 
@@ -819,6 +836,7 @@ async function route({ request, env, params }) {
       if (m.recalled) return json({ ok: true });
       if (now - m.created_at > LIMITS.DM_RECALL_MS) return failc('dm_recall_time');
       await db.prepare("UPDATE dm_msgs SET recalled = 1, body = '' WHERE id = ?1").bind(m.id).run();
+      await dropAtts(db, 'dm', m.id);
       return json({ ok: true });
     }
 
@@ -879,6 +897,128 @@ async function route({ request, env, params }) {
       if (!r) return failc('report_gone', 404);
       await db.prepare("UPDATE dm_reports SET status = 'done', handled_by = ?2, handled_at = ?3, note = ?4 WHERE id = ?1").bind(r.id, user, now, note).run();
       return json({ ok: true });
+    }
+
+
+    // ---------- 2901网盘 ----------
+    case 'drive_list': {
+      const cfg = ghCfg(env);
+      if (cfg) { try { await gcTick(db, cfg, 2); } catch (e) { /* 清理失败下次再试 */ } }
+      if (!Number(b.offset) && !b.folder) { try { await sweepDrive(db, now); } catch (e) {} }   // 打开网盘根目录时顺手清一次没挂上的孤儿图片
+      const fid = Math.max(0, Math.floor(Number(b.folder)) || 0);
+      let folder = null, path = [];
+      if (fid) {
+        folder = await db.prepare('SELECT id, name, parent FROM drive_folders WHERE id = ?1 AND owner = ?2').bind(fid, user).first();
+        if (!folder) return failc('drive_folder_gone', 404);
+        let cur = folder; for (let i = 0; cur && i < 6; i++) { path.unshift({ id: cur.id, name: cur.name }); cur = cur.parent ? await db.prepare('SELECT id, name, parent FROM drive_folders WHERE id = ?1 AND owner = ?2').bind(cur.parent, user).first() : null; }
+      }
+      const offset = Math.max(0, Math.floor(Number(b.offset)) || 0);
+      const { results: folders } = offset ? { results: [] } : await db.prepare('SELECT id, name FROM drive_folders WHERE owner = ?1 AND parent = ?2 ORDER BY name').bind(user, fid).all();
+      const { results: rows } = await db.prepare("SELECT id, name, size, mime, share_all, created_at FROM drive_files WHERE owner = ?1 AND kind = 'file' AND folder = ?2 ORDER BY created_at DESC, id LIMIT ?3 OFFSET ?4").bind(user, fid, LIMITS.DRIVE_PAGE + 1, offset).all();
+      const files = rows.slice(0, LIMITS.DRIVE_PAGE);
+      const sh = new Map();
+      if (files.length) {
+        const { results: sr } = await db.prepare(`SELECT file_id, to_user FROM drive_shares WHERE file_id IN (${files.map(() => '?').join(',')})`).bind(...files.map((f) => f.id)).all();
+        for (const r of sr) { if (!sh.has(r.file_id)) sh.set(r.file_id, []); sh.get(r.file_id).push(r.to_user); }
+      }
+      const used = await db.prepare("SELECT COALESCE(SUM(size), 0) AS n FROM drive_files WHERE owner = ?1 AND kind = 'file'").bind(user).first();
+      return json({ ok: true, enabled: !!cfg, folder, path, folders, hasMore: rows.length > LIMITS.DRIVE_PAGE, used: used.n, quota: LIMITS.DRIVE_QUOTA, file_max: LIMITS.DRIVE_FILE_MAX,
+        files: files.map((f) => ({ ...f, share_all: !!f.share_all, shares: sh.get(f.id) || [] })) });
+    }
+    case 'drive_folder_create': {
+      const name = clean(String(b.name || '').replace(/\s+/g, ' '), LIMITS.DFOLDER_NAME);
+      if (!name) return failc('drive_name');
+      const parent = Math.max(0, Math.floor(Number(b.parent)) || 0);
+      let depth = 1;
+      if (parent) {
+        let cur = await db.prepare('SELECT parent FROM drive_folders WHERE id = ?1 AND owner = ?2').bind(parent, user).first();
+        if (!cur) return failc('drive_folder_gone', 404);
+        depth = 2; for (let i = 0; cur && cur.parent && i < 8; i++) { cur = await db.prepare('SELECT parent FROM drive_folders WHERE id = ?1').bind(cur.parent).first(); depth++; }
+        if (depth > LIMITS.DFOLDER_DEPTH) return failc('drive_depth');
+      }
+      const n = await db.prepare('SELECT COUNT(*) AS n FROM drive_folders WHERE owner = ?1').bind(user).first();
+      if (n.n >= LIMITS.DFOLDERS_MAX) return failc('drive_folders_many');
+      if (await db.prepare('SELECT 1 AS x FROM drive_folders WHERE owner = ?1 AND parent = ?2 AND name = ?3').bind(user, parent, name).first()) return failc('drive_dup');
+      const r = await db.prepare('INSERT INTO drive_folders (owner, name, parent, created_at) VALUES (?1, ?2, ?3, ?4)').bind(user, name, parent, now).run();
+      return json({ ok: true, id: r.meta.last_row_id });
+    }
+    case 'drive_folder_rename': {
+      const name = clean(String(b.name || '').replace(/\s+/g, ' '), LIMITS.DFOLDER_NAME);
+      if (!name) return failc('drive_name');
+      const f = await db.prepare('SELECT id, parent FROM drive_folders WHERE id = ?1 AND owner = ?2').bind(Number(b.id), user).first();
+      if (!f) return failc('drive_folder_gone', 404);
+      if (await db.prepare('SELECT 1 AS x FROM drive_folders WHERE owner = ?1 AND parent = ?2 AND name = ?3 AND id != ?4').bind(user, f.parent, name, f.id).first()) return failc('drive_dup');
+      await db.prepare('UPDATE drive_folders SET name = ?2 WHERE id = ?1').bind(f.id, name).run();
+      return json({ ok: true });
+    }
+    case 'drive_folder_delete': {   // 只能删空文件夹
+      const f = await db.prepare('SELECT id FROM drive_folders WHERE id = ?1 AND owner = ?2').bind(Number(b.id), user).first();
+      if (!f) return json({ ok: true });
+      const c1 = await db.prepare('SELECT COUNT(*) AS n FROM drive_folders WHERE owner = ?1 AND parent = ?2').bind(user, f.id).first();
+      const c2 = await db.prepare("SELECT COUNT(*) AS n FROM drive_files WHERE owner = ?1 AND kind = 'file' AND folder = ?2").bind(user, f.id).first();
+      if (c1.n || c2.n) return failc('drive_not_empty');
+      await db.prepare('DELETE FROM drive_folders WHERE id = ?1').bind(f.id).run();
+      return json({ ok: true });
+    }
+    case 'drive_rename': {
+      const name = cleanFileName(b.name);
+      if (!name) return failc('drive_name');
+      const r = await db.prepare("UPDATE drive_files SET name = ?3 WHERE id = ?1 AND owner = ?2 AND kind = 'file'").bind(String(b.id || ''), user, name).run();
+      return json({ ok: true });
+    }
+    case 'drive_move': {
+      const folder = Math.max(0, Math.floor(Number(b.folder)) || 0);
+      if (folder && !(await db.prepare('SELECT 1 AS x FROM drive_folders WHERE id = ?1 AND owner = ?2').bind(folder, user).first())) return failc('drive_folder_gone', 404);
+      await db.prepare("UPDATE drive_files SET folder = ?3 WHERE id = ?1 AND owner = ?2 AND kind = 'file'").bind(String(b.id || ''), user, folder).run();
+      return json({ ok: true });
+    }
+    case 'drive_delete': {   // 删除网盘文件：同时从帖子 / 私信的附件里消失；GitHub 上的内容进清理队列
+      const f = await db.prepare("SELECT id, repo, path, sha FROM drive_files WHERE id = ?1 AND owner = ?2 AND kind = 'file'").bind(String(b.id || ''), user).first();
+      if (!f) return json({ ok: true });
+      await db.batch([
+        db.prepare('INSERT INTO drive_gc (repo, path, sha) VALUES (?1, ?2, ?3)').bind(f.repo, f.path, f.sha),
+        db.prepare('DELETE FROM drive_att WHERE file_id = ?1').bind(f.id),
+        db.prepare('DELETE FROM drive_shares WHERE file_id = ?1').bind(f.id),
+        db.prepare('DELETE FROM drive_files WHERE id = ?1').bind(f.id),
+      ]);
+      const cfg = ghCfg(env); if (cfg) { try { await gcTick(db, cfg, 3); } catch (e) {} }
+      return json({ ok: true });
+    }
+    case 'drive_share': {   // all=true 所有登录用户可见；users 指定的人可见；都不选 = 仅自己。没有公开链接
+      const f = await db.prepare("SELECT id FROM drive_files WHERE id = ?1 AND owner = ?2 AND kind = 'file'").bind(String(b.id || ''), user).first();
+      if (!f) return failc('drive_gone', 404);
+      const names = [...new Set((Array.isArray(b.users) ? b.users : []).map((x) => String(x)).filter((x) => x && x !== user))];
+      if (names.length > LIMITS.SHARE_USERS_MAX) return failc('share_many');
+      let valid = [];
+      if (names.length) { const { results } = await db.prepare(`SELECT username FROM users WHERE username IN (${names.map(() => '?').join(',')})`).bind(...names).all(); valid = results.map((r) => r.username); }
+      await db.batch([
+        db.prepare('UPDATE drive_files SET share_all = ?2 WHERE id = ?1').bind(f.id, b.all ? 1 : 0),
+        db.prepare('DELETE FROM drive_shares WHERE file_id = ?1').bind(f.id),
+        ...valid.map((u) => db.prepare('INSERT OR IGNORE INTO drive_shares (file_id, to_user, created_at) VALUES (?1, ?2, ?3)').bind(f.id, u, now)),
+      ]);
+      return json({ ok: true, users: valid });
+    }
+    case 'drive_shared': {   // 别人分享给我的（含分享给所有人的）
+      const offset = Math.max(0, Math.floor(Number(b.offset)) || 0);
+      const { results } = await db.prepare(`SELECT f.id, f.owner, f.name, f.size, f.mime, f.created_at, a.updated_at AS av FROM drive_files f LEFT JOIN avatars a ON a.username = f.owner
+          WHERE f.kind = 'file' AND f.owner != ?1 AND (f.share_all = 1 OR f.id IN (SELECT file_id FROM drive_shares WHERE to_user = ?1))
+            AND f.owner NOT IN (SELECT blocker FROM blocks WHERE blocked = ?1) AND f.owner NOT IN (SELECT blocked FROM blocks WHERE blocker = ?1)
+          ORDER BY f.created_at DESC LIMIT ?2 OFFSET ?3`).bind(user, LIMITS.DRIVE_PAGE + 1, offset).all();
+      return json({ ok: true, files: results.slice(0, LIMITS.DRIVE_PAGE), hasMore: results.length > LIMITS.DRIVE_PAGE });
+    }
+    case 'drive_get': {   // 下载文件 / 查看图片：有权限才返回，内容从 GitHub 流式转发
+      const cfg = ghCfg(env);
+      if (!cfg) return failc('drive_off', 503);
+      const f = await db.prepare('SELECT * FROM drive_files WHERE id = ?1').bind(String(b.id || '')).first();
+      if (!f || !(await canReadFile(db, user, f))) return failc('drive_gone', 404);
+      const up = await ghFetch(cfg, 'GET', f.repo, f.path, null, 'application/vnd.github.raw+json');
+      if (!up.ok) return failc(up.status === 404 ? 'drive_gone' : 'drive_upstream', up.status === 404 ? 404 : 502);
+      const img = f.kind === 'img';
+      const ct = img ? f.mime : (DRIVE_MIMEBAD.test(f.mime) ? 'application/octet-stream' : f.mime);
+      const headers = { ...cors, 'Content-Type': ct, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=3600', 'Content-Security-Policy': "sandbox; default-src 'none'" };
+      if (!img) headers['Content-Disposition'] = "attachment; filename*=UTF-8''" + encodeURIComponent(f.name).replace(/['()]/g, escape);
+      if (up.headers.get('content-length')) headers['Content-Length'] = up.headers.get('content-length');
+      return new Response(up.body, { status: 200, headers });
     }
 
     // ---------- 管理员专用 ----------
@@ -1025,8 +1165,182 @@ function metaStmts(db, pid, meta, replace) {
 // ---------- 辅助：投票 / 问卷 ----------
 // 注销账号时要一起清掉的新数据：他的点赞、投票、问卷答卷、他发的问卷，以及他的帖子上的点赞 / 投票
 // （同样的清理在 functions/api/[action].js 的 purgeForum 里也有一份，改这里时记得同步）
+// ---------- 2901网盘：存储在 GitHub 私有仓库 ----------
+// 需要在 Cloudflare Pages 的环境变量里配置：GH_TOKEN（Secret，细粒度 PAT，对存储仓库有 Contents 读写）、GH_OWNER（账号或组织名）、GH_REPOS（仓库名，逗号分隔，满了自动用下一个）、可选 GH_BRANCH
+const DRIVE_MIMEBAD = /html|svg|javascript|xml/i;
+function ghCfg(env) {
+  if (!env.GH_TOKEN || !env.GH_OWNER) return null;
+  const repos = String(env.GH_REPOS || '').split(',').map((x) => x.trim()).filter(Boolean);
+  return repos.length ? { token: env.GH_TOKEN, owner: env.GH_OWNER, repos, branch: env.GH_BRANCH || '' } : null;
+}
+function ghUrl(cfg, repo, path, get) {
+  return `https://api.github.com/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(repo)}/contents/${path}` + (get && cfg.branch ? `?ref=${encodeURIComponent(cfg.branch)}` : '');
+}
+function ghHeaders(cfg, accept, json) {
+  return { Authorization: 'Bearer ' + cfg.token, Accept: accept || 'application/vnd.github+json', 'User-Agent': '2901-drive', 'X-GitHub-Api-Version': '2022-11-28', ...(json ? { 'Content-Type': 'application/json' } : {}) };
+}
+function ghFetch(cfg, method, repo, path, body, accept) {
+  return fetch(ghUrl(cfg, repo, path, method === 'GET'), { method, headers: ghHeaders(cfg, accept, !!body), body: body ? JSON.stringify(body) : undefined });
+}
+async function ghDelete(cfg, repo, path, sha) {
+  for (let i = 0; i < 3; i++) {
+    const r = await ghFetch(cfg, 'DELETE', repo, path, { message: 'rm', sha, ...(cfg.branch ? { branch: cfg.branch } : {}) });
+    if (r.ok || r.status === 404) return true;
+    if (r.status !== 409 && r.status < 500) return false;
+    await new Promise((res) => setTimeout(res, 300 * (i + 1)));
+  }
+  return false;
+}
+// 清理队列：删文件 / 删账号只改数据库，GitHub 上的内容由这里慢慢删（每次最多 n 个）
+async function gcTick(db, cfg, n) {
+  const { results } = await db.prepare('SELECT id, repo, path, sha, tries FROM drive_gc ORDER BY id LIMIT ?1').bind(n).all();
+  for (const g of results) {
+    if (await ghDelete(cfg, g.repo, g.path, g.sha)) await db.prepare('DELETE FROM drive_gc WHERE id = ?1').bind(g.id).run();
+    else if (g.tries >= 6) await db.prepare('DELETE FROM drive_gc WHERE id = ?1').bind(g.id).run();
+    else await db.prepare('UPDATE drive_gc SET tries = tries + 1 WHERE id = ?1').bind(g.id).run();
+  }
+}
+function randId() { const a = new Uint8Array(12); crypto.getRandomValues(a); return Array.from(a, (x) => x.toString(16).padStart(2, '0')).join(''); }
+function cleanFileName(s) {
+  const n = clean(String(s == null ? '' : s).replace(/[\\/\u0000-\u001f]/g, '_').replace(/\s+/g, ' '), LIMITS.DRIVE_NAME);
+  return n && n !== '.' && n !== '..' ? n : null;
+}
+const IMG_MAGIC = { 'image/jpeg': [0xff, 0xd8, 0xff], 'image/png': [0x89, 0x50, 0x4e, 0x47], 'image/gif': [0x47, 0x49, 0x46, 0x38], 'image/webp': [0x52, 0x49, 0x46, 0x46] };
+
+// 上传：正文是文件内容的 base64 文本（浏览器 btoa / FileReader 生成，已带 = 补齐），元数据在 X-Drive 头里（URL 编码的 JSON）。
+// 不解析 JSON、不解码 base64，只是把它拼进 GitHub 的 PUT 请求里流式转发，所以 25MB 的文件也几乎不占 CPU。
+async function driveUpload(request, env) {
+  const db = env.DB;
+  let meta; try { meta = JSON.parse(decodeURIComponent(request.headers.get('X-Drive') || '')); } catch (e) { return failc('drive_bad'); }
+  const sess = meta && meta.token ? await db.prepare('SELECT username, created_at FROM sessions WHERE token = ?').bind(String(meta.token)).first() : null;
+  if (!sess || Date.now() - sess.created_at > SESSION_MS) return fail('登录已过期', 401);
+  const user = sess.username, now = Date.now();
+  await ensureSchema(db);
+  const cfg = ghCfg(env);
+  if (!cfg) return failc('drive_off', 503);
+  const img = meta.kind === 'img';
+  const size = Math.floor(Number(meta.size));
+  if (!(size > 0)) return failc('drive_bad');
+  if (size > (img ? LIMITS.IMG_MAX : LIMITS.DRIVE_FILE_MAX)) return failc('drive_big', 413);
+  const b64len = Math.ceil(size / 3) * 4;
+  const cl = Number(request.headers.get('Content-Length'));
+  if (cl && cl !== b64len) return failc('drive_bad');
+  if (!request.body) return failc('drive_bad');
+  let name, mime, folder = 0;
+  if (img) {
+    mime = String(meta.mime || ''); name = 'image';
+    if (!IMG_MAGIC[mime]) return failc('drive_bad');
+  } else {
+    name = cleanFileName(meta.name); if (!name) return failc('drive_name');
+    mime = clean(String(meta.mime || ''), 100) || 'application/octet-stream';
+    if (!/^[\w.+-]+\/[\w.+-]+$/.test(mime)) mime = 'application/octet-stream';
+    folder = Math.max(0, Math.floor(Number(meta.folder)) || 0);
+    if (folder && !(await db.prepare('SELECT 1 AS x FROM drive_folders WHERE id = ?1 AND owner = ?2').bind(folder, user).first())) return failc('drive_folder_gone', 404);
+  }
+  const kind = img ? 'img' : 'file';
+  const used = await db.prepare('SELECT COALESCE(SUM(size), 0) AS n FROM drive_files WHERE owner = ?1 AND kind = ?2').bind(user, kind).first();
+  if (used.n + size > (img ? LIMITS.IMG_QUOTA : LIMITS.DRIVE_QUOTA)) return failc('drive_quota', 413);
+  const day = await db.prepare('SELECT COUNT(*) AS n FROM drive_files WHERE owner = ?1 AND kind = ?2 AND created_at > ?3').bind(user, kind, now - 86400000).first();
+  if (day.n >= (img ? LIMITS.IMG_DAILY : LIMITS.UP_DAILY)) return failc('drive_limit', 429);
+  const { results: usage } = await db.prepare('SELECT repo, SUM(size) AS n FROM drive_files GROUP BY repo').all();
+  const by = new Map(usage.map((r) => [r.repo, r.n]));
+  const repo = cfg.repos.find((r) => (by.get(r) || 0) + size <= LIMITS.REPO_SOFT);
+  if (!repo) return failc('drive_full', 507);
+  const id = randId();
+  const path = `d/${id.slice(0, 2)}/${id}`;
+  const enc = new TextEncoder();
+  const pre = enc.encode(JSON.stringify({ message: 'add', ...(cfg.branch ? { branch: cfg.branch } : {}) }).slice(0, -1) + ',"content":"');
+  const post = enc.encode('"}');
+  let reqBody;
+  if (typeof FixedLengthStream !== 'undefined') {
+    const { readable, writable } = new FixedLengthStream(pre.length + b64len + post.length);
+    (async () => {
+      const w = writable.getWriter();
+      try { await w.write(pre); const rd = request.body.getReader(); for (;;) { const { done, value } = await rd.read(); if (done) break; await w.write(value); } await w.write(post); await w.close(); }
+      catch (e) { try { await w.abort(e); } catch (e2) {} }
+    })();
+    reqBody = readable;
+  } else {   // 本地测试环境：直接拼字符串
+    reqBody = new TextDecoder().decode(pre) + await request.text() + '"}';
+  }
+  let up;
+  try { up = await fetch(ghUrl(cfg, repo, path), { method: 'PUT', headers: ghHeaders(cfg, null, true), body: reqBody, ...(typeof FixedLengthStream !== 'undefined' ? { duplex: 'half' } : {}) }); }
+  catch (e) { return failc('drive_upstream', 502); }
+  if (!up.ok) return up.status === 409 ? failc('drive_busy', 503) : failc('drive_upstream', 502);
+  const j = await up.json().catch(() => null);
+  const sha = j && j.content && j.content.sha;
+  if (!sha) return failc('drive_upstream', 502);
+  if (img) {   // 图片：确认文件头与声明的类型一致，不一致就丢掉（不让人用图片接口存别的东西当图床）
+    const chk = await fetch(ghUrl(cfg, repo, path, true), { headers: { ...ghHeaders(cfg, 'application/vnd.github.raw+json'), Range: 'bytes=0-11' } }).then((r) => r.ok ? r.arrayBuffer() : null).catch(() => null);
+    if (chk) {
+      const u8 = new Uint8Array(chk).subarray(0, 12), mg = IMG_MAGIC[mime];
+      if (!mg.every((x, i) => u8[i] === x)) { await ghDelete(cfg, repo, path, sha); return failc('drive_bad'); }
+    }
+  }
+  try {
+    await db.prepare('INSERT INTO drive_files (id, owner, kind, name, folder, size, mime, repo, path, sha, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)').bind(id, user, kind, name, folder, size, mime, repo, path, sha, now).run();
+  } catch (e) { await db.prepare('INSERT INTO drive_gc (repo, path, sha) VALUES (?1, ?2, ?3)').bind(repo, path, sha).run(); return failc('drive_upstream', 502); }
+  return json({ ok: true, id, name, size, mime, kind });
+}
+
+async function canReadFile(db, user, f) {
+  if (f.owner === user) return true;
+  if (f.kind === 'file') {
+    if (await db.prepare('SELECT 1 AS x FROM blocks WHERE (blocker = ?1 AND blocked = ?2) OR (blocker = ?2 AND blocked = ?1)').bind(user, f.owner).first()) return false;
+    if (f.share_all) return true;
+    if (await db.prepare('SELECT 1 AS x FROM drive_shares WHERE file_id = ?1 AND to_user = ?2').bind(f.id, user).first()) return true;
+  }
+  if (await db.prepare("SELECT 1 AS x FROM drive_att a JOIN posts p ON p.id = a.ref WHERE a.file_id = ?1 AND a.kind = 'post'").bind(f.id).first()) return true;
+  if (await db.prepare("SELECT 1 AS x FROM drive_att a JOIN dm_msgs m ON m.id = a.ref JOIN dm_convs c ON c.id = m.conv_id WHERE a.file_id = ?1 AND a.kind = 'dm' AND m.recalled = 0 AND (c.user_a = ?2 OR c.user_b = ?2)").bind(f.id, user).first()) return true;
+  return false;
+}
+// 校验附件：必须是自己的文件 / 图片，数量不超限
+async function validateAtt(db, user, ids, kind) {
+  ids = [...new Set((Array.isArray(ids) ? ids : []).map((x) => String(x)).filter((x) => /^[0-9a-f]{24}$/.test(x)))];
+  if (!ids.length) return [];
+  const { results } = await db.prepare(`SELECT id, kind FROM drive_files WHERE owner = ?1 AND id IN (${ids.map(() => '?').join(',')})`).bind(user, ...ids).all();
+  if (results.length !== ids.length) return 'att_gone';
+  const imgs = results.filter((r) => r.kind === 'img').length, files = results.length - imgs;
+  if (kind === 'post' ? (imgs > LIMITS.ATT_POST_IMGS || files > LIMITS.ATT_POST_FILES) : results.length > LIMITS.ATT_DM) return 'att_many';
+  return results;
+}
+async function loadAtts(db, kind, refs) {
+  const out = new Map();
+  if (!refs.length) return out;
+  const { results } = await db.prepare(`SELECT a.ref, f.id, f.kind, f.name, f.size, f.mime FROM drive_att a JOIN drive_files f ON f.id = a.file_id WHERE a.kind = ?1 AND a.ref IN (${refs.map(() => '?').join(',')}) ORDER BY f.created_at`).bind(kind, ...refs).all();
+  for (const r of results) { if (!out.has(r.ref)) out.set(r.ref, []); out.get(r.ref).push({ id: r.id, kind: r.kind, name: r.name, size: r.size, mime: r.mime }); }
+  return out;
+}
+// 帖子删除 / 私信撤回：附件关系删掉；只挂在这里的图片进清理队列（网盘文件只是不再挂着，文件本身还在网盘里）
+async function dropAtts(db, kind, ref) {
+  try {
+    const cond = "kind = 'img' AND id IN (SELECT file_id FROM drive_att WHERE kind = ?1 AND ref = ?2) AND id NOT IN (SELECT file_id FROM drive_att WHERE NOT (kind = ?1 AND ref = ?2))";
+    await db.batch([
+      db.prepare(`INSERT INTO drive_gc (repo, path, sha) SELECT repo, path, sha FROM drive_files WHERE ${cond}`).bind(kind, ref),
+      db.prepare(`DELETE FROM drive_files WHERE ${cond}`).bind(kind, ref),
+      db.prepare('DELETE FROM drive_att WHERE kind = ?1 AND ref = ?2').bind(kind, ref),
+    ]);
+  } catch (e) { /* 网盘表还没建 */ }
+}
+// 兜底清理：帖子 / 私信已不存在的附件关系，以及超过 2 小时还没挂到任何地方的图片
+async function sweepDrive(db, now) {
+  const old = now - LIMITS.ORPHAN_MS;
+  const cond = "kind = 'img' AND created_at < ?1 AND id NOT IN (SELECT file_id FROM drive_att)";
+  await db.batch([
+    db.prepare("DELETE FROM drive_att WHERE kind = 'post' AND ref NOT IN (SELECT id FROM posts)"),
+    db.prepare("DELETE FROM drive_att WHERE kind = 'dm' AND ref NOT IN (SELECT id FROM dm_msgs)"),
+    db.prepare(`INSERT INTO drive_gc (repo, path, sha) SELECT repo, path, sha FROM drive_files WHERE ${cond}`).bind(old),
+    db.prepare(`DELETE FROM drive_files WHERE ${cond}`).bind(old),
+  ]);
+}
+
 function userContentCleanup(db, u) {
   return [
+    db.prepare('INSERT INTO drive_gc (repo, path, sha) SELECT repo, path, sha FROM drive_files WHERE owner = ?1').bind(u),
+    db.prepare('DELETE FROM drive_att WHERE file_id IN (SELECT id FROM drive_files WHERE owner = ?1)').bind(u),
+    db.prepare('DELETE FROM drive_shares WHERE to_user = ?1 OR file_id IN (SELECT id FROM drive_files WHERE owner = ?1)').bind(u),
+    db.prepare('DELETE FROM drive_files WHERE owner = ?1').bind(u),
+    db.prepare('DELETE FROM drive_folders WHERE owner = ?1').bind(u),
     db.prepare('DELETE FROM likes WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
     db.prepare('DELETE FROM poll_votes WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
     db.prepare('DELETE FROM polls WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
