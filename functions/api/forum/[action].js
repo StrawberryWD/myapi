@@ -19,7 +19,6 @@ const LIMITS = {
   TITLE: 60,           // 标题最多字数
   POST: 2000,          // 帖子正文最多字数
   REPLY: 300,          // 单条回复最多字数
-  KEEP_POSTS: 2000,    // 最多保留的帖子数，超出自动删掉最久没动静的
   MAX_REPLIES: 100,    // 每个帖子最多回复条数
   POST_GAP_MS: 20000,  // 同一用户两次发帖最小间隔
   REPLY_GAP_MS: 5000,  // 同一用户两次回复最小间隔
@@ -266,21 +265,6 @@ async function route({ request, env, params }) {
       if (meta.topics.length || meta.tags.length) await db.batch(metaStmts(db, id, meta, false));
       if (attRows.length) await db.batch(attRows.map((f) => db.prepare("INSERT OR IGNORE INTO drive_att (file_id, kind, ref) VALUES (?1, 'post', ?2)").bind(f.id, id)));
       if (poll) await db.prepare('INSERT INTO polls (post_id, multi, closes_at, options, anon, vis) VALUES (?1, ?2, ?3, ?4, ?5, ?6)').bind(id, poll.multi, poll.closes_at, JSON.stringify(poll.options), poll.anon, poll.vis).run();
-      if (id % 20 === 0) {   // 每 20 个帖子顺手清理一次，只留最近活跃的 KEEP_POSTS 个
-        await db.batch([
-          db.prepare('DELETE FROM posts WHERE id IN (SELECT id FROM posts ORDER BY last_at DESC, id DESC LIMIT -1 OFFSET ?1)').bind(LIMITS.KEEP_POSTS),
-          db.prepare('DELETE FROM replies WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM likes WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM polls WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM poll_votes WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM reply_likes WHERE reply_id NOT IN (SELECT id FROM replies)'),
-          db.prepare('DELETE FROM post_topics WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM post_tags WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM pins WHERE post_id NOT IN (SELECT id FROM posts)'),
-          db.prepare('DELETE FROM bookmarks WHERE post_id NOT IN (SELECT id FROM posts)'),
-        ]);
-        try { await sweepDrive(db, now); } catch (e) { /* 网盘表不影响发帖 */ }
-      }
       return json({ ok: true, id });
     }
 
@@ -920,7 +904,7 @@ async function route({ request, env, params }) {
     case 'drive_list': {
       const cfg = ghCfg(env);
       if (cfg) { try { await gcTick(db, cfg, 2); } catch (e) { /* 清理失败下次再试 */ } }
-      if (now % 10 === 0) { try { await sweepDrive(db, now); } catch (e) {} }
+      if (!Number(b.offset) && !b.folder) { try { await sweepDrive(db, now); } catch (e) {} }   // 打开网盘根目录时顺手清一次没挂上的孤儿图片
       const fid = Math.max(0, Math.floor(Number(b.folder)) || 0);
       let folder = null, path = [];
       if (fid) {
