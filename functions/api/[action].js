@@ -125,6 +125,9 @@ async function route({ request, env, params }) {
       try {
         await db.prepare('INSERT INTO users (username, password) VALUES (?, ?)')
           .bind(username, await encPw(env, password)).run();
+        // 记录注册时间（个人主页用）：列不存在就先加；失败不影响注册
+        try { await db.prepare('ALTER TABLE users ADD COLUMN created_at INTEGER').run(); } catch (e) {}
+        try { await db.prepare('UPDATE users SET created_at = ? WHERE username = ?').bind(Date.now(), username).run(); } catch (e) {}
         return json({ ok: true });
       } catch (e) {
         if (/UNIQUE|constraint/i.test(String(e && e.message))) {
@@ -296,6 +299,16 @@ async function route({ request, env, params }) {
 
 // 删除某用户在论坛的全部内容（帖子连同帖子下的回复，以及他在别人帖子下的回复）
 async function purgeForum(db, username) {
+  // 网盘：GitHub 上的文件进清理队列，由论坛接口慢慢删；表还没建就忽略
+  try {
+    await db.batch([
+      db.prepare('INSERT INTO drive_gc (repo, path, sha) SELECT repo, path, sha FROM drive_files WHERE owner = ?1').bind(username),
+      db.prepare('DELETE FROM drive_att WHERE file_id IN (SELECT id FROM drive_files WHERE owner = ?1)').bind(username),
+      db.prepare('DELETE FROM drive_shares WHERE to_user = ?1 OR file_id IN (SELECT id FROM drive_files WHERE owner = ?1)').bind(username),
+      db.prepare('DELETE FROM drive_files WHERE owner = ?1').bind(username),
+      db.prepare('DELETE FROM drive_folders WHERE owner = ?1').bind(username),
+    ]);
+  } catch (e) {}
   // 新功能的表（点赞 / 投票 / 问卷）可能还没建，单独执行并忽略错误，不影响下面老的清理
   try {
     await db.batch([
@@ -304,6 +317,12 @@ async function purgeForum(db, username) {
       db.prepare('DELETE FROM polls WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(username),
       db.prepare('DELETE FROM reply_likes WHERE reply_id IN (SELECT id FROM replies WHERE author = ?1 OR post_id IN (SELECT id FROM posts WHERE author = ?1))').bind(username),
       db.prepare('DELETE FROM reply_likes WHERE username = ?1').bind(username),
+      db.prepare('DELETE FROM dm_msgs WHERE conv_id IN (SELECT id FROM dm_convs WHERE user_a = ?1 OR user_b = ?1)').bind(username),
+      db.prepare('DELETE FROM dm_convs WHERE user_a = ?1 OR user_b = ?1').bind(username),
+      db.prepare('DELETE FROM blocks WHERE blocker = ?1 OR blocked = ?1').bind(username),
+      db.prepare('DELETE FROM dm_reports WHERE reporter = ?1 OR reported = ?1').bind(username),
+      db.prepare('DELETE FROM follows WHERE follower = ?1 OR followee = ?1').bind(username),
+      db.prepare('DELETE FROM profiles WHERE username = ?1').bind(username),
       db.prepare('DELETE FROM post_topics WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(username),
       db.prepare('DELETE FROM post_tags WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(username),
       db.prepare('DELETE FROM pins WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(username),
