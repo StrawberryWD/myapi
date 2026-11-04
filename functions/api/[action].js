@@ -12,6 +12,7 @@ const json = (obj, status = 200) =>
 const SESSION_MS = 30 * 24 * 3600 * 1000; // 登录 30 天有效
 const MAX_SAVE = 20000;                   // 存档最大字符数
 const HIDDEN = ['admin', 'root'];         // 不上榜、不可注销的账号；也是管理员（可看密码，密码可用中文）
+const RENAME_GAP_MS = 7 * 24 * 3600 * 1000;  // 两次改名至少间隔 7 天
 const MAX_AVATAR = 150000;                // 头像 base64 最大字符数（约 110KB）；前端会把图片压到远小于此
 
 // ---------- 防积分作弊 ----------
@@ -279,6 +280,64 @@ async function route({ request, env, params }) {
   }
 
   // ---------- 注销账户：删除用户、存档、所有登录会话 ----------
+  // ---------- 更改用户名：要输入当前密码；7 天内只能改一次；所有表里的旧名字一起换成新名字 ----------
+  if (action === 'rename') {
+    const oldName = sess.username;
+    if (HIDDEN.includes(oldName.toLowerCase())) return json({ error: '该账户不能改用户名', code: 'rename_admin' }, 403);
+    const nu = String(body.new_username || '').trim();
+    if (!nu) return json({ error: '请填写新用户名', code: 'rename_empty' }, 400);
+    if (Array.from(nu).length > 32) return json({ error: '用户名太长', code: 'rename_long' }, 400);
+    if (/[\u0000-\u001F\u007F\u2028\u2029]/.test(nu)) return json({ error: '用户名含有不能用的字符', code: 'rename_chars' }, 400);
+    if (nu === oldName) return json({ error: '新用户名和现在的一样', code: 'rename_same' }, 400);
+    if (HIDDEN.includes(nu.toLowerCase())) return json({ error: '这个用户名已被占用', code: 'rename_taken' }, 409);
+    const row = await db.prepare('SELECT password FROM users WHERE username = ?').bind(oldName).first();
+    if (!row || !(await pwMatch(env, row.password, String(body.password || '')))) return json({ error: '当前密码不正确', code: 'rename_pw' }, 403);
+    try { await db.prepare('ALTER TABLE users ADD COLUMN renamed_at INTEGER').run(); } catch (e) {}
+    const now = Date.now();
+    const last = await db.prepare('SELECT renamed_at AS t FROM users WHERE username = ?').bind(oldName).first();
+    if (last && last.t && now - last.t < RENAME_GAP_MS) {
+      return json({ error: '改名太频繁，下次可改名时间：' + new Date(last.t + RENAME_GAP_MS).toISOString(), code: 'rename_gap', next: last.t + RENAME_GAP_MS }, 429);
+    }
+    // 不区分大小写也不能和别人重名（避免长得一样的两个账号）
+    if (await db.prepare('SELECT 1 AS x FROM users WHERE username = ?1 OR LOWER(username) = LOWER(?1)').bind(nu).first()) {
+      return json({ error: '这个用户名已被占用', code: 'rename_taken' }, 409);
+    }
+    // 只处理已经存在的表（论坛表可能还没建）
+    const { results: tl } = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
+    const has = new Set(tl.map((r) => r.name));
+    const COLS = [
+      ['saves', 'username'], ['avatars', 'username'], ['profiles', 'username'],
+      ['posts', 'author'], ['replies', 'author'], ['replies', 'reply_to'],
+      ['likes', 'username'], ['reply_likes', 'username'], ['poll_votes', 'username'],
+      ['follows', 'follower'], ['follows', 'followee'], ['blocks', 'blocker'], ['blocks', 'blocked'],
+      ['dm_msgs', 'sender'], ['dm_reports', 'reporter'], ['dm_reports', 'reported'], ['dm_reports', 'handled_by'],
+      ['topics', 'creator'], ['pins', 'by'], ['bookmark_folders', 'username'], ['bookmarks', 'username'],
+      ['surveys', 'author'], ['survey_responses', 'username'],
+      ['drive_folders', 'owner'], ['drive_files', 'owner'], ['drive_shares', 'to_user'],
+    ];
+    const st = [
+      db.prepare('UPDATE users SET username = ?2, renamed_at = ?3 WHERE username = ?1').bind(oldName, nu, now),
+      db.prepare('UPDATE sessions SET username = ?2 WHERE username = ?1').bind(oldName, nu),
+    ];
+    for (const [t, c] of COLS) if (has.has(t)) st.push(db.prepare(`UPDATE OR REPLACE ${t} SET ${c} = ?2 WHERE ${c} = ?1`).bind(oldName, nu));
+    if (has.has('dm_convs')) {
+      // 私信会话按名字字典序配对（user_a < user_b）：名字换了顺序可能翻转，翻转时把 a / b 两边的已读、清空进度一起对调
+      const { results: cv } = await db.prepare('SELECT * FROM dm_convs WHERE user_a = ?1 OR user_b = ?1').bind(oldName).all();
+      for (const c of cv) {
+        const other = c.user_a === oldName ? c.user_b : c.user_a;
+        const meWasA = c.user_a === oldName;
+        const meIsA = nu < other;
+        const mine = meWasA ? { rd: c.a_read, cl: c.a_clear } : { rd: c.b_read, cl: c.b_clear };
+        const theirs = meWasA ? { rd: c.b_read, cl: c.b_clear } : { rd: c.a_read, cl: c.a_clear };
+        const A = meIsA ? mine : theirs, B = meIsA ? theirs : mine;
+        st.push(db.prepare('UPDATE dm_convs SET user_a = ?2, user_b = ?3, a_read = ?4, b_read = ?5, a_clear = ?6, b_clear = ?7 WHERE id = ?1')
+          .bind(c.id, meIsA ? nu : other, meIsA ? other : nu, A.rd, B.rd, A.cl, B.cl));
+      }
+    }
+    await db.batch(st);   // 一个事务：要么全改，要么都不改
+    return json({ ok: true, username: nu });
+  }
+
   if (action === 'delete') {
     if (HIDDEN.includes(sess.username.toLowerCase())) {
       return json({ error: '该账户不允许注销' }, 403);
