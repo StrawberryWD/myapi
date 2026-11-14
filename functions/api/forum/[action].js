@@ -318,17 +318,46 @@ async function route({ request, env, params }) {
       return json({ ok: true, edited_at: now });
     }
 
-    case 'post_edit': {   // 只有作者能改自己的帖子标题和正文
-      const post = await db.prepare('SELECT author FROM posts WHERE id = ?1').bind(Number(b.id)).first();
+    case 'post_edit': {   // 作者或管理员：改标题和正文、删帖子里的图片/附件；只有作者能新增附件（新附件来自作者自己的网盘/上传）
+      const pid = Number(b.id);
+      const post = await db.prepare('SELECT author FROM posts WHERE id = ?1').bind(pid).first();
       if (!post) return failc('post_gone', 404);
-      if (post.author !== user) return failc('edit_forbidden', 403);
+      const isOwner = post.author === user;
+      if (!isOwner && !isAdmin) return failc('edit_forbidden', 403);
       const title = clean(String(b.title || '').replace(/\s+/g, ' '), LIMITS.TITLE);
       const body = clean(b.body, LIMITS.POST);
       if (title === null) return fail(`标题最多 ${LIMITS.TITLE} 字`);
       if (body === null) return fail(`正文最多 ${LIMITS.POST} 字`);
       if (!title || !body) return fail('标题和正文都不能为空');
-      await db.prepare('UPDATE posts SET title = ?2, body = ?3, edited_at = ?4 WHERE id = ?1').bind(Number(b.id), title, body, now).run();
-      return json({ ok: true, edited_at: now });
+      const hex = (x) => [...new Set((Array.isArray(x) ? x : []).map(String).filter((v) => /^[0-9a-f]{24}$/.test(v)))];
+      const rm = hex(b.att_remove), add = isOwner ? hex(b.att_add) : [];
+      let addRows = [];
+      if (add.length) {
+        const v = await validateAtt(db, user, add, 'post');
+        if (typeof v === 'string') return failc(v);
+        addRows = v;
+      }
+      if (rm.length || addRows.length) {
+        // 先算出改完以后的附件总数，不能超过上限
+        const cur = (await loadAtts(db, 'post', [pid])).get(pid) || [];
+        const keep = cur.filter((x) => !rm.includes(x.id));
+        const merged = keep.concat(addRows.filter((x) => !keep.some((k) => k.id === x.id)));
+        const imgs = merged.filter((x) => x.kind === 'img').length;
+        if (imgs > LIMITS.ATT_POST_IMGS || merged.length - imgs > LIMITS.ATT_POST_FILES) return failc('att_many');
+        const st = [];
+        for (const fid of rm) {
+          if (!cur.some((x) => x.id === fid)) continue;
+          // 帖子专用图片（kind=img）如果没有别处引用，连同 GitHub 上的文件一起删；网盘里的普通文件只是从帖子上摘掉，原文件还在作者网盘里
+          const cond = "id = ?1 AND kind = 'img' AND NOT EXISTS (SELECT 1 FROM drive_att WHERE file_id = ?1 AND NOT (kind = 'post' AND ref = ?2))";
+          st.push(db.prepare(`INSERT INTO drive_gc (repo, path, sha) SELECT repo, path, sha FROM drive_files WHERE ${cond}`).bind(fid, pid));
+          st.push(db.prepare(`DELETE FROM drive_files WHERE ${cond}`).bind(fid, pid));
+          st.push(db.prepare("DELETE FROM drive_att WHERE file_id = ?1 AND kind = 'post' AND ref = ?2").bind(fid, pid));
+        }
+        for (const f of addRows) st.push(db.prepare("INSERT OR IGNORE INTO drive_att (file_id, kind, ref) VALUES (?1, 'post', ?2)").bind(f.id, pid));
+        await db.batch(st);
+      }
+      await db.prepare('UPDATE posts SET title = ?2, body = ?3, edited_at = ?4 WHERE id = ?1').bind(pid, title, body, now).run();
+      return json({ ok: true, edited_at: now, atts: (await loadAtts(db, 'post', [pid])).get(pid) || [] });
     }
 
     case 'delete': {   // 自己的帖子/回复可删；管理员可删任何人的
