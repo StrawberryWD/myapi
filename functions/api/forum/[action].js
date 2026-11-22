@@ -1104,7 +1104,7 @@ async function route({ request, env, params }) {
       if (!target) return fail('参数错误');
       let rows = [];
       try {
-        const r = await db.prepare('SELECT ts, ip, country, ua, via, ok FROM login_log WHERE username = ?1 ORDER BY id DESC LIMIT 60').bind(target).all();
+        const r = await db.prepare('SELECT ts, ip, country, ua, via, ok FROM login_log WHERE username = ?1 ORDER BY id DESC LIMIT 100 OFFSET ?2').bind(target, Math.max(0, parseInt(b.offset, 10) || 0)).all();
         rows = r.results;
       } catch (e) {}
       // 同一个 IP 出现在多少个别的账号上（共用 / 小号提示）
@@ -1116,7 +1116,7 @@ async function route({ request, env, params }) {
           if (r.results.length) shared[ip] = r.results.map((x) => x.username);
         } catch (e) {}
       }
-      return json({ ok: true, logins: rows, shared });
+      return json({ ok: true, logins: rows, shared, more: rows.length === 100 });
     }
 
     case 'admin_delete_user': {   // 强制注销账号：账号、存档、登录状态、论坛帖子和回复全部删除

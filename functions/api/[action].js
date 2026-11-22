@@ -111,27 +111,63 @@ function clientInfo(request, env) {
   const country = (via === 'relay' ? h.get('x-client-country') : '') || cf.country || '';
   return { ip: String(ip).slice(0, 64), via, country: String(country).slice(0, 8), ua: String(h.get('user-agent') || '').slice(0, 160) };
 }
-async function logLogin(db, request, env, username, ok) {
+async function logLogin(db, request, env, username, ok, waitUntil) {
   try {
-    await db.prepare('CREATE TABLE IF NOT EXISTS login_log (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, ts INTEGER NOT NULL, ip TEXT, country TEXT, ua TEXT, via TEXT, ok INTEGER NOT NULL DEFAULT 1)').run();
+    await db.prepare('CREATE TABLE IF NOT EXISTS login_log (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, ts INTEGER NOT NULL, ip TEXT, country TEXT, ua TEXT, via TEXT, ok INTEGER NOT NULL DEFAULT 1, archived INTEGER NOT NULL DEFAULT 0)').run();
     await db.prepare('CREATE INDEX IF NOT EXISTS idx_login_user ON login_log (username, ts)').run();
     const c = clientInfo(request, env);
     await db.prepare('INSERT INTO login_log (username, ts, ip, country, ua, via, ok) VALUES (?1,?2,?3,?4,?5,?6,?7)')
       .bind(username, Date.now(), c.ip, c.country, c.ua, c.via, ok ? 1 : 0).run();
-    // 每人只留最近 60 条
-    await db.prepare('DELETE FROM login_log WHERE username = ?1 AND id NOT IN (SELECT id FROM login_log WHERE username = ?1 ORDER BY id DESC LIMIT 60)').bind(username).run();
+    // 永久保留：数据库里不删；同时攒够一批就追加归档到 GitHub（见 flushLoginLog）
+    if (waitUntil) waitUntil(flushLoginLog(db, env, 1).catch(() => {}));
   } catch (e) {}   // 记录失败绝不影响登录
+}
+
+// 把还没归档的登录记录按天追加到 GitHub 仓库（和网盘同一个仓库/令牌）：loginlog/YYYY-MM-DD.jsonl，一行一条
+// minPending：待归档条数不到这个数就先不动（现在每次登录都归档，传 1）
+async function flushLoginLog(db, env, minPending) {
+  if (!env.GH_TOKEN || !env.GH_OWNER) return 0;
+  const repo = String(env.GH_REPOS || '').split(',').map((x) => x.trim()).filter(Boolean)[0];
+  if (!repo) return 0;
+  let rows;
+  const q = 'SELECT id, username, ts, ip, country, ua, via, ok FROM login_log WHERE archived = 0 ORDER BY id LIMIT 300';
+  try { rows = (await db.prepare(q).all()).results; }
+  catch (e) {
+    try { await db.prepare('ALTER TABLE login_log ADD COLUMN archived INTEGER NOT NULL DEFAULT 0').run(); rows = (await db.prepare(q).all()).results; } catch (e2) { return 0; }
+  }
+  if (!rows.length || rows.length < minPending) return 0;
+  const day = (ts) => new Date(ts + 8 * 3600e3).toISOString().slice(0, 10);   // 按北京时间分天
+  const byDay = {};
+  for (const r of rows) (byDay[day(r.ts)] = byDay[day(r.ts)] || []).push(r);
+  const base = `https://api.github.com/repos/${encodeURIComponent(env.GH_OWNER)}/${encodeURIComponent(repo)}/contents/`;
+  const hd = { Authorization: 'Bearer ' + env.GH_TOKEN, Accept: 'application/vnd.github+json', 'User-Agent': '2901-loginlog', 'X-GitHub-Api-Version': '2022-11-28' };
+  const br = env.GH_BRANCH ? `?ref=${encodeURIComponent(env.GH_BRANCH)}` : '';
+  let done = 0;
+  for (const [d, list] of Object.entries(byDay)) {
+    const path = `loginlog/${d}.jsonl`;
+    let old = '', sha;
+    const g = await fetch(base + path + br, { headers: hd });
+    if (g.ok) { const j = await g.json(); sha = j.sha; old = new TextDecoder().decode(Uint8Array.from(atob(String(j.content || '').replace(/\n/g, '')), (c) => c.charCodeAt(0))); }
+    else if (g.status !== 404) continue;
+    const add = list.map((r) => JSON.stringify({ id: r.id, user: r.username, time: new Date(r.ts + 8 * 3600e3).toISOString().replace('Z', '+08:00'), ip: r.ip, country: r.country, ua: r.ua, via: r.via, ok: !!r.ok })).join('\n') + '\n';
+    const bytes = new TextEncoder().encode(old + add); let bin = ''; for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    const put = await fetch(base + path, { method: 'PUT', headers: { ...hd, 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'loginlog ' + d, content: btoa(bin), ...(sha ? { sha } : {}), ...(env.GH_BRANCH ? { branch: env.GH_BRANCH } : {}) }) });
+    if (!put.ok) continue;   // 冲突/失败：这批保持未归档，下次再来
+    await db.prepare(`UPDATE login_log SET archived = 1 WHERE id IN (${list.map(() => '?').join(',')})`).bind(...list.map((r) => r.id)).run();
+    done += list.length;
+  }
+  return done;
 }
 
 export async function onRequestPost(ctx) {
   try {
-    return await route(ctx);
+    return await route({ request: ctx.request, env: ctx.env, params: ctx.params, waitUntil: ctx.waitUntil ? ctx.waitUntil.bind(ctx) : null });
   } catch (e) {
     return json({ error: '服务器错误：' + (e && e.message ? e.message : e) }, 500);
   }
 }
 
-async function route({ request, env, params }) {
+async function route({ request, env, params, waitUntil }) {
   const db = env.DB;
   if (!db) return json({ error: '数据库未绑定（Settings → Bindings，变量名 DB）' }, 500);
 
@@ -165,7 +201,7 @@ async function route({ request, env, params }) {
     const row = await db.prepare('SELECT password FROM users WHERE username = ?')
       .bind(username).first();
     if (!row || !(await pwMatch(env, row.password, password))) {
-      if (row) await logLogin(db, request, env, username, false);   // 只记录真实存在的账号的失败（防垃圾名字撑爆表）
+      if (row) await logLogin(db, request, env, username, false, waitUntil);   // 只记录真实存在的账号的失败（防垃圾名字撑爆表）
       return json({ error: '用户名或密码错误' }, 401);
     }
     // 旧的明文密码：登录成功时顺手升级为加密存储
@@ -176,7 +212,7 @@ async function route({ request, env, params }) {
     const token = crypto.randomUUID();
     await db.prepare('INSERT INTO sessions (token, username, created_at) VALUES (?, ?, ?)')
       .bind(token, username, Date.now()).run();
-    await logLogin(db, request, env, username, true);
+    await logLogin(db, request, env, username, true, waitUntil);
     return json({ ok: true, username, token });
   }
 
