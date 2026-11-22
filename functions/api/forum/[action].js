@@ -159,12 +159,14 @@ async function ensureSchema(db) {
   schemaReady = true;
 }
 
+import { recordAccess } from '../../_lib/loginlog.js';
+
 export async function onRequestPost(ctx) {
-  try { return await route(ctx); }
+  try { return await route({ request: ctx.request, env: ctx.env, params: ctx.params, waitUntil: ctx.waitUntil ? ctx.waitUntil.bind(ctx) : null }); }
   catch (e) { return json({ ok: false, error: '服务器错误：' + (e && e.message ? e.message : e) }, 500); }
 }
 
-async function route({ request, env, params }) {
+async function route({ request, env, params, waitUntil }) {
   const db = env.DB;
   if (!db) return fail('数据库未绑定（Settings → Bindings，变量名 DB）', 500);
   if (params.action === 'drive_upload') return driveUpload(request, env);   // 上传走原始 base64 正文 + X-Drive 头，不经过 JSON 解析
@@ -175,6 +177,7 @@ async function route({ request, env, params }) {
     : null;
   if (!sess || Date.now() - sess.created_at > SESSION_MS) return fail('登录已过期', 401);
   const user = sess.username;
+  await recordAccess(db, request, env, user, 'visit', true, waitUntil);
   const isAdmin = ADMINS.includes(user.toLowerCase());
   const now = Date.now();
   await ensureSchema(db);
@@ -1098,13 +1101,36 @@ async function route({ request, env, params }) {
       return json({ ok: true, users: results.map((u) => ({ ...u, last: lastMap[u.username] || null, protected: ADMINS.includes(u.username.toLowerCase()) })) });
     }
 
+    case 'admin_login_feed': {   // 全站登录/访问记录流：可按用户名、IP 筛选，最新在前
+      if (!isAdmin) return fail('需要管理员权限', 403);
+      const where = [], args = [];
+      const qu = String(b.user || '').trim(), qi = String(b.ip || '').trim();
+      if (qu) { args.push(qu); where.push('username = ?' + args.length); }
+      if (qi) { args.push(qi); where.push('ip = ?' + args.length); }
+      if (b.failed) where.push('ok = 0');
+      if (b.kind === 'login' || b.kind === 'visit') { args.push(b.kind); where.push('kind = ?' + args.length); }
+      args.push(Math.max(0, parseInt(b.offset, 10) || 0));
+      let rows = [], multi = [];
+      try {
+        rows = (await db.prepare(`SELECT id, username, ts, ip, country, ua, via, ok, kind FROM login_log ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT 100 OFFSET ?${args.length}`).bind(...args).all()).results;
+        if (!(b.offset > 0) && !qu && !qi) {
+          // 风险提示：最近 7 天内，一个 IP 登录了 3 个以上账号 / 一个账号用了 4 个以上 IP
+          const since = Date.now() - 7 * 86400e3;
+          const a = (await db.prepare("SELECT ip, COUNT(DISTINCT username) AS n, GROUP_CONCAT(DISTINCT username) AS users FROM login_log WHERE ts > ?1 AND ok = 1 AND ip <> '' GROUP BY ip HAVING n >= 3 ORDER BY n DESC LIMIT 10").bind(since).all()).results;
+          const u2 = (await db.prepare("SELECT username, COUNT(DISTINCT ip) AS n FROM login_log WHERE ts > ?1 AND ok = 1 GROUP BY username HAVING n >= 4 ORDER BY n DESC LIMIT 10").bind(since).all()).results;
+          multi = { ips: a.map((x) => ({ ip: x.ip, n: x.n, users: String(x.users).split(',').slice(0, 10) })), users: u2 };
+        }
+      } catch (e) {}
+      return json({ ok: true, rows, more: rows.length === 100, risk: multi && multi.ips ? multi : null });
+    }
+
     case 'admin_logins': {   // 某个用户最近的登录记录（时间、IP、国家、设备、成败）
       if (!isAdmin) return fail('需要管理员权限', 403);
       const target = String(b.target || '').trim();
       if (!target) return fail('参数错误');
       let rows = [];
       try {
-        const r = await db.prepare('SELECT ts, ip, country, ua, via, ok FROM login_log WHERE username = ?1 ORDER BY id DESC LIMIT 100 OFFSET ?2').bind(target, Math.max(0, parseInt(b.offset, 10) || 0)).all();
+        const r = await db.prepare('SELECT ts, ip, country, ua, via, ok, kind FROM login_log WHERE username = ?1 ORDER BY id DESC LIMIT 100 OFFSET ?2').bind(target, Math.max(0, parseInt(b.offset, 10) || 0)).all();
         rows = r.results;
       } catch (e) {}
       // 同一个 IP 出现在多少个别的账号上（共用 / 小号提示）
