@@ -99,6 +99,30 @@ export async function onRequestGet({ env }) {
   return json({ ok: true, hint: 'api alive', db, password: env.PW_KEY ? '加密存储已启用' : '未设置 PW_KEY，密码仍是明文' });
 }
 
+
+// ---------- 登录记录（admin/root 风控用） ----------
+// 真实 IP：直连时是 CF-Connecting-IP；经 Supabase 中转时那是中转服务器的 IP，
+// 中转函数会带上 X-Client-IP + X-Relay-Key（和 Cloudflare 里的 RELAY_KEY 一致才采信，防伪造）。
+function clientInfo(request, env) {
+  const h = request.headers;
+  let ip = h.get('cf-connecting-ip') || '', via = 'direct';
+  if (env.RELAY_KEY && h.get('x-relay-key') === env.RELAY_KEY && h.get('x-client-ip')) { ip = String(h.get('x-client-ip')).slice(0, 64); via = 'relay'; }
+  const cf = request.cf || {};
+  const country = (via === 'relay' ? h.get('x-client-country') : '') || cf.country || '';
+  return { ip: String(ip).slice(0, 64), via, country: String(country).slice(0, 8), ua: String(h.get('user-agent') || '').slice(0, 160) };
+}
+async function logLogin(db, request, env, username, ok) {
+  try {
+    await db.prepare('CREATE TABLE IF NOT EXISTS login_log (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, ts INTEGER NOT NULL, ip TEXT, country TEXT, ua TEXT, via TEXT, ok INTEGER NOT NULL DEFAULT 1)').run();
+    await db.prepare('CREATE INDEX IF NOT EXISTS idx_login_user ON login_log (username, ts)').run();
+    const c = clientInfo(request, env);
+    await db.prepare('INSERT INTO login_log (username, ts, ip, country, ua, via, ok) VALUES (?1,?2,?3,?4,?5,?6,?7)')
+      .bind(username, Date.now(), c.ip, c.country, c.ua, c.via, ok ? 1 : 0).run();
+    // 每人只留最近 60 条
+    await db.prepare('DELETE FROM login_log WHERE username = ?1 AND id NOT IN (SELECT id FROM login_log WHERE username = ?1 ORDER BY id DESC LIMIT 60)').bind(username).run();
+  } catch (e) {}   // 记录失败绝不影响登录
+}
+
 export async function onRequestPost(ctx) {
   try {
     return await route(ctx);
@@ -140,7 +164,10 @@ async function route({ request, env, params }) {
 
     const row = await db.prepare('SELECT password FROM users WHERE username = ?')
       .bind(username).first();
-    if (!row || !(await pwMatch(env, row.password, password))) return json({ error: '用户名或密码错误' }, 401);
+    if (!row || !(await pwMatch(env, row.password, password))) {
+      if (row) await logLogin(db, request, env, username, false);   // 只记录真实存在的账号的失败（防垃圾名字撑爆表）
+      return json({ error: '用户名或密码错误' }, 401);
+    }
     // 旧的明文密码：登录成功时顺手升级为加密存储
     if (env.PW_KEY && !String(row.password).startsWith(ENC_PREFIX)) {
       try { await db.prepare('UPDATE users SET password = ? WHERE username = ?').bind(await encPw(env, password), username).run(); } catch (e) {}
@@ -149,6 +176,7 @@ async function route({ request, env, params }) {
     const token = crypto.randomUUID();
     await db.prepare('INSERT INTO sessions (token, username, created_at) VALUES (?, ?, ?)')
       .bind(token, username, Date.now()).run();
+    await logLogin(db, request, env, username, true);
     return json({ ok: true, username, token });
   }
 
@@ -313,7 +341,7 @@ async function route({ request, env, params }) {
       ['dm_msgs', 'sender'], ['dm_reports', 'reporter'], ['dm_reports', 'reported'], ['dm_reports', 'handled_by'],
       ['topics', 'creator'], ['pins', 'by'], ['bookmark_folders', 'username'], ['bookmarks', 'username'],
       ['surveys', 'author'], ['survey_responses', 'username'],
-      ['forum_mods', 'username'], ['forum_mods', 'granted_by'], ['drive_folders', 'owner'], ['drive_files', 'owner'], ['drive_shares', 'to_user'],
+      ['login_log', 'username'], ['forum_mods', 'username'], ['forum_mods', 'granted_by'], ['drive_folders', 'owner'], ['drive_files', 'owner'], ['drive_shares', 'to_user'],
     ];
     const st = [
       db.prepare('UPDATE users SET username = ?2, renamed_at = ?3 WHERE username = ?1').bind(oldName, nu, now),
@@ -358,6 +386,7 @@ async function route({ request, env, params }) {
 
 // 删除某用户在论坛的全部内容（帖子连同帖子下的回复，以及他在别人帖子下的回复）
 async function purgeForum(db, username) {
+  try { await db.prepare('DELETE FROM login_log WHERE username = ?1').bind(username).run(); } catch (e) {}
   try { await db.prepare('DELETE FROM forum_mods WHERE username = ?1').bind(username).run(); } catch (e) {}   // 版主名单（表可能还没建）
   // 网盘：GitHub 上的文件进清理队列，由论坛接口慢慢删；表还没建就忽略
   try {

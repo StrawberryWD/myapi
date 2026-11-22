@@ -1082,13 +1082,41 @@ async function route({ request, env, params }) {
     // ---------- 管理员专用 ----------
     case 'admin_users': {
       if (!isAdmin) return fail('需要管理员权限', 403);
+      let lastMap = {};
+      try {
+        const { results: ll } = await db.prepare(
+          `SELECT l.username AS u, l.ts AS ts, l.ip AS ip, l.country AS country FROM login_log l
+           WHERE l.ok = 1 AND l.id = (SELECT MAX(id) FROM login_log x WHERE x.username = l.username AND x.ok = 1)`).all();
+        for (const r of ll) lastMap[r.u] = r;
+      } catch (e) {}   // 表还没建（还没有人登录过）
       const { results } = await db.prepare(
         `SELECT u.username AS username,
                 (SELECT COUNT(*) FROM posts p WHERE p.author = u.username) AS posts,
                 (SELECT COUNT(*) FROM replies r WHERE r.author = u.username) AS replies,
                 (SELECT updated_at FROM avatars a WHERE a.username = u.username) AS av
          FROM users u ORDER BY u.username LIMIT 500`).all();
-      return json({ ok: true, users: results.map((u) => ({ ...u, protected: ADMINS.includes(u.username.toLowerCase()) })) });
+      return json({ ok: true, users: results.map((u) => ({ ...u, last: lastMap[u.username] || null, protected: ADMINS.includes(u.username.toLowerCase()) })) });
+    }
+
+    case 'admin_logins': {   // 某个用户最近的登录记录（时间、IP、国家、设备、成败）
+      if (!isAdmin) return fail('需要管理员权限', 403);
+      const target = String(b.target || '').trim();
+      if (!target) return fail('参数错误');
+      let rows = [];
+      try {
+        const r = await db.prepare('SELECT ts, ip, country, ua, via, ok FROM login_log WHERE username = ?1 ORDER BY id DESC LIMIT 60').bind(target).all();
+        rows = r.results;
+      } catch (e) {}
+      // 同一个 IP 出现在多少个别的账号上（共用 / 小号提示）
+      const ips = [...new Set(rows.map((x) => x.ip).filter(Boolean))].slice(0, 20);
+      const shared = {};
+      for (const ip of ips) {
+        try {
+          const r = await db.prepare('SELECT DISTINCT username FROM login_log WHERE ip = ?1 AND ok = 1 AND username <> ?2 LIMIT 8').bind(ip, target).all();
+          if (r.results.length) shared[ip] = r.results.map((x) => x.username);
+        } catch (e) {}
+      }
+      return json({ ok: true, logins: rows, shared });
     }
 
     case 'admin_delete_user': {   // 强制注销账号：账号、存档、登录状态、论坛帖子和回复全部删除
@@ -1108,6 +1136,7 @@ async function route({ request, env, params }) {
         db.prepare('DELETE FROM sessions WHERE username = ?1').bind(target),
         db.prepare('DELETE FROM users WHERE username = ?1').bind(target),
       ]);
+      try { await db.prepare('DELETE FROM login_log WHERE username = ?1').bind(target).run(); } catch (e) {}
       return json({ ok: true });
     }
 
