@@ -313,7 +313,7 @@ async function route({ request, env, params }) {
       ['dm_msgs', 'sender'], ['dm_reports', 'reporter'], ['dm_reports', 'reported'], ['dm_reports', 'handled_by'],
       ['topics', 'creator'], ['pins', 'by'], ['bookmark_folders', 'username'], ['bookmarks', 'username'],
       ['surveys', 'author'], ['survey_responses', 'username'],
-      ['drive_folders', 'owner'], ['drive_files', 'owner'], ['drive_shares', 'to_user'],
+      ['forum_mods', 'username'], ['forum_mods', 'granted_by'], ['drive_folders', 'owner'], ['drive_files', 'owner'], ['drive_shares', 'to_user'],
     ];
     const st = [
       db.prepare('UPDATE users SET username = ?2, renamed_at = ?3 WHERE username = ?1').bind(oldName, nu, now),
@@ -358,6 +358,7 @@ async function route({ request, env, params }) {
 
 // 删除某用户在论坛的全部内容（帖子连同帖子下的回复，以及他在别人帖子下的回复）
 async function purgeForum(db, username) {
+  try { await db.prepare('DELETE FROM forum_mods WHERE username = ?1').bind(username).run(); } catch (e) {}   // 版主名单（表可能还没建）
   // 网盘：GitHub 上的文件进清理队列，由论坛接口慢慢删；表还没建就忽略
   try {
     await db.batch([

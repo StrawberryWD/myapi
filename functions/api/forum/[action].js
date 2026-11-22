@@ -36,7 +36,7 @@ const LIMITS = {
   FOLDER_NAME: 20, FOLDERS_MAX: 20, MARK_PAGE: 20,   // 收藏夹
   TOPIC_GAP_MS: 10000, // 同一用户两次建话题最小间隔
   // 2901网盘
-  DRIVE_QUOTA: 500 * 1024 * 1024, DRIVE_FILE_MAX: 25 * 1024 * 1024, IMG_QUOTA: 100 * 1024 * 1024, IMG_MAX: 2 * 1024 * 1024, IMG_DAILY: 40, UP_DAILY: 100,
+  MOD_MAX: 20, DRIVE_QUOTA: 500 * 1024 * 1024, DRIVE_FILE_MAX: 25 * 1024 * 1024, IMG_QUOTA: 100 * 1024 * 1024, IMG_MAX: 2 * 1024 * 1024, IMG_DAILY: 40, UP_DAILY: 100,
   REPO_SOFT: 800 * 1024 * 1024, DRIVE_NAME: 80, DFOLDER_NAME: 30, DFOLDERS_MAX: 100, DFOLDER_DEPTH: 3, DRIVE_PAGE: 50, SHARE_USERS_MAX: 20,
   ATT_POST_IMGS: 9, ATT_POST_FILES: 5, ATT_DM: 1, ORPHAN_MS: 2 * 3600 * 1000,
 };
@@ -45,6 +45,7 @@ const EMSG = {
   topic_exists: '已有同名话题', topic_name: '请填写话题名称（最多 20 字）', topic_desc: '话题说明最多 100 字', topic_many: '话题数量已达上限',
   topic_forbidden: '只有话题创建者或管理员能操作', pin_forbidden: '没有置顶权限', pin_full: '置顶已满（每个范围最多 3 条）',
   pin_scope: '这个帖子不属于该话题', folder_gone: '收藏夹不存在', folder_name: '请填写收藏夹名称（最多 20 字）', folder_many: '收藏夹最多 20 个',
+  mod_full: '版主最多 20 人', mod_nouser: '没有这个用户', mod_admin: '管理员不需要设为版主', mod_self: '不能给自己设置',
   post_gone: '帖子不存在或已被删除', admin_only: '需要管理员权限', reply_gone: '这条回复不存在或已被删除', edit_forbidden: '只能修改自己的内容',
   user_gone: '用户不存在', follow_self: '不能关注自己', private: '对方没有公开这部分内容', bio_len: '简介最多 200 字',
   dm_self: '不能给自己发私信', dm_blocked: '无法给对方发送私信', dm_you_blocked: '你已拉黑对方，先取消拉黑才能发私信', dm_empty: '消息不能为空', dm_len: '消息最多 500 字',
@@ -57,6 +58,7 @@ const EMSG = {
 const failc = (code, status = 400, extra) => json({ ok: false, error: EMSG[code] || code, code, ...(extra || {}) }, status);
 
 const SCHEMA = [
+  'CREATE TABLE IF NOT EXISTS forum_mods (username TEXT PRIMARY KEY, granted_by TEXT NOT NULL, granted_at INTEGER NOT NULL)',
   `CREATE TABLE IF NOT EXISTS posts (
      id INTEGER PRIMARY KEY AUTOINCREMENT, author TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
      created_at INTEGER NOT NULL, last_at INTEGER NOT NULL, reply_count INTEGER NOT NULL DEFAULT 0)`,
@@ -176,6 +178,9 @@ async function route({ request, env, params }) {
   const isAdmin = ADMINS.includes(user.toLowerCase());
   const now = Date.now();
   await ensureSchema(db);
+  // 版主：管理员授予的“只能管理帖子”的权限（删帖、改帖、删帖内图片、改话题标签、置顶）；不能管理管理员的帖子，不能碰评论、私信、用户、举报
+  const isMod = !isAdmin && !!(await db.prepare('SELECT 1 AS x FROM forum_mods WHERE username = ?1').bind(user).first());
+  const canManage = (author) => isAdmin || (isMod && !ADMINS.includes(String(author).toLowerCase()));
 
   switch (params.action) {
     case 'list': {
@@ -212,7 +217,7 @@ async function route({ request, env, params }) {
       const rows = await listPosts(db, user, where, args, `${SORTS[sort]} ${dir}, p.id ${dir}`, LIMITS.PAGE + 1, offset);
       const posts = rows.slice(0, LIMITS.PAGE);
       await attachMeta(db, [...posts, ...pinned]);
-      return json({ ok: true, me: user, admin: isAdmin, posts, pinned, hasMore: rows.length > LIMITS.PAGE, sort, dir: dir.toLowerCase() });
+      return json({ ok: true, me: user, admin: isAdmin, mod: isMod, posts, pinned, hasMore: rows.length > LIMITS.PAGE, sort, dir: dir.toLowerCase() });
     }
 
     case 'post': {
@@ -236,11 +241,12 @@ async function route({ request, env, params }) {
       post.pins = pn;
       // 当前用户能在哪些范围置顶这个帖子
       const opts = [];
-      if (isAdmin) opts.push({ scope: 'global' });
-      for (const t of post.topics) if (isAdmin || t.creator === user) opts.push({ scope: 'topic:' + t.id, name: t.name });
+      if (canManage(post.author)) opts.push({ scope: 'global' });
+      for (const t of post.topics) if (canManage(post.author) || t.creator === user) opts.push({ scope: 'topic:' + t.id, name: t.name });
+      post.can_manage = canManage(post.author);
       post.pin_options = opts;
       post.atts = (await loadAtts(db, 'post', [id])).get(id) || [];
-      return json({ ok: true, me: user, admin: isAdmin, post, replies: results, poll: await loadPoll(db, id, user, now, isAdmin) });
+      return json({ ok: true, me: user, admin: isAdmin, mod: isMod, post, replies: results, poll: await loadPoll(db, id, user, now, isAdmin) });
     }
 
     case 'create': {
@@ -323,7 +329,7 @@ async function route({ request, env, params }) {
       const post = await db.prepare('SELECT author FROM posts WHERE id = ?1').bind(pid).first();
       if (!post) return failc('post_gone', 404);
       const isOwner = post.author === user;
-      if (!isOwner && !isAdmin) return failc('edit_forbidden', 403);
+      if (!isOwner && !canManage(post.author)) return failc('edit_forbidden', 403);
       const title = clean(String(b.title || '').replace(/\s+/g, ' '), LIMITS.TITLE);
       const body = clean(b.body, LIMITS.POST);
       if (title === null) return fail(`标题最多 ${LIMITS.TITLE} 字`);
@@ -365,7 +371,7 @@ async function route({ request, env, params }) {
       if (b.type === 'post') {
         const p = await db.prepare('SELECT author FROM posts WHERE id = ?1').bind(id).first();
         if (!p) return json({ ok: true });
-        if (p.author !== user && !isAdmin) return fail('只能删除自己的帖子', 403);
+        if (p.author !== user && !canManage(p.author)) return fail('只能删除自己的帖子', 403);
         await dropAtts(db, 'post', id);
         await db.batch([
           db.prepare('DELETE FROM reply_likes WHERE reply_id IN (SELECT id FROM replies WHERE post_id = ?1)').bind(id),
@@ -593,7 +599,7 @@ async function route({ request, env, params }) {
       const id = Number(b.id);
       const post = await db.prepare('SELECT author FROM posts WHERE id = ?1').bind(id).first();
       if (!post) return failc('post_gone', 404);
-      if (post.author !== user && !isAdmin) return fail('只能修改自己的帖子', 403);
+      if (post.author !== user && !canManage(post.author)) return fail('只能修改自己的帖子', 403);
       const meta = await parseMeta(db, b);
       if (typeof meta === 'string') return failc(meta);
       await db.batch(metaStmts(db, id, meta, true));
@@ -604,15 +610,15 @@ async function route({ request, env, params }) {
     case 'pin': {
       const pid = Number(b.post_id);
       const scope = String(b.scope || '');
-      const post = await db.prepare('SELECT id FROM posts WHERE id = ?1').bind(pid).first();
+      const post = await db.prepare('SELECT id, author FROM posts WHERE id = ?1').bind(pid).first();
       if (!post) return failc('post_gone', 404);
-      if (scope === 'global') { if (!isAdmin) return failc('pin_forbidden', 403); }
+      if (scope === 'global') { if (!canManage(post.author)) return failc('pin_forbidden', 403); }
       else {
         const m = /^topic:(\d+)$/.exec(scope);
         if (!m) return failc('pin_scope');
         const tp = await db.prepare('SELECT creator FROM topics WHERE id = ?1').bind(Number(m[1])).first();
         if (!tp) return failc('topic_gone', 404);
-        if (!isAdmin && tp.creator !== user) return failc('pin_forbidden', 403);
+        if (!canManage(post.author) && tp.creator !== user) return failc('pin_forbidden', 403);
         const inT = await db.prepare('SELECT 1 AS x FROM post_topics WHERE post_id = ?1 AND topic_id = ?2').bind(pid, Number(m[1])).first();
         if (!inT) return failc('pin_scope');
       }
@@ -695,7 +701,7 @@ async function route({ request, env, params }) {
       const av = await db.prepare('SELECT updated_at FROM avatars WHERE username = ?1').bind(u.username).first();
       const n = async (sql, ...a) => (await db.prepare(sql).bind(...a).first()).n;
       const out = {
-        username: u.username, av: av ? av.updated_at : null, bio: pf.bio, joined: u.created_at || null, is_me: me, is_admin: ADMINS.includes(u.username.toLowerCase()),
+        username: u.username, av: av ? av.updated_at : null, bio: pf.bio, joined: u.created_at || null, is_me: me, is_admin: ADMINS.includes(u.username.toLowerCase()), is_mod: !!(await db.prepare('SELECT 1 AS x FROM forum_mods WHERE username = ?1').bind(u.username).first()),
         post_count: await n('SELECT COUNT(*) AS n FROM posts WHERE author = ?1', u.username),
         reply_count: await n('SELECT COUNT(*) AS n FROM replies WHERE author = ?1 AND deleted = 0', u.username),
         likes_received: (await n('SELECT COUNT(*) AS n FROM likes WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)', u.username))
@@ -708,7 +714,7 @@ async function route({ request, env, params }) {
         can: { posts: me || !!pf.show_posts, comments: me || !!pf.show_comments, likes: me || !!pf.show_likes, marks: me || !!pf.show_marks, follows: me || !!pf.show_follows },
       };
       if (me) out.privacy = { show_posts: !!pf.show_posts, show_comments: !!pf.show_comments, show_likes: !!pf.show_likes, show_marks: !!pf.show_marks, show_follows: !!pf.show_follows };
-      return json({ ok: true, me: user, admin: isAdmin, profile: out });
+      return json({ ok: true, me: user, admin: isAdmin, mod: isMod, profile: out });
     }
 
     case 'profile_set': {   // 只改自己的：简介 + 哪些内容对别人可见
@@ -911,6 +917,29 @@ async function route({ request, env, params }) {
       const reason = clean(b.reason, LIMITS.REASON_LEN) || '';
       await db.prepare('INSERT INTO dm_reports (reporter, reported, reason, msgs, created_at) VALUES (?1, ?2, ?3, ?4, ?5)')
         .bind(user, peer, reason, JSON.stringify(results.map((m) => ({ sender: m.sender, body: m.body, created_at: m.created_at }))), now).run();
+      return json({ ok: true });
+    }
+    // ---------- 版主：只有管理员能增删、查看名单 ----------
+    case 'mod_list': {
+      if (!isAdmin) return failc('admin_only', 403);
+      const { results } = await db.prepare('SELECT username, granted_by, granted_at FROM forum_mods ORDER BY granted_at DESC').all();
+      return json({ ok: true, mods: results, max: LIMITS.MOD_MAX });
+    }
+    case 'mod_add': {
+      if (!isAdmin) return failc('admin_only', 403);
+      const t = String(b.target || '').trim();
+      const u = await db.prepare('SELECT username FROM users WHERE username = ?1').bind(t).first();
+      if (!u) return failc('mod_nouser', 404);
+      if (ADMINS.includes(u.username.toLowerCase())) return failc('mod_admin');
+      const c = await db.prepare('SELECT COUNT(*) AS n FROM forum_mods').first();
+      const has = await db.prepare('SELECT 1 AS x FROM forum_mods WHERE username = ?1').bind(u.username).first();
+      if (!has && c.n >= LIMITS.MOD_MAX) return failc('mod_full');
+      await db.prepare('INSERT OR REPLACE INTO forum_mods (username, granted_by, granted_at) VALUES (?1, ?2, ?3)').bind(u.username, user, now).run();
+      return json({ ok: true });
+    }
+    case 'mod_remove': {
+      if (!isAdmin) return failc('admin_only', 403);
+      await db.prepare('DELETE FROM forum_mods WHERE username = ?1').bind(String(b.target || '')).run();
       return json({ ok: true });
     }
     case 'report_list': {   // 管理员：只能看到举报里附带的消息快照
