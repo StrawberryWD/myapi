@@ -1116,12 +1116,36 @@ async function route({ request, env, params, waitUntil }) {
         if (!(b.offset > 0) && !qu && !qi) {
           // 风险提示：最近 7 天内，一个 IP 登录了 3 个以上账号 / 一个账号用了 4 个以上 IP
           const since = Date.now() - 7 * 86400e3;
-          const a = (await db.prepare("SELECT ip, COUNT(DISTINCT username) AS n, GROUP_CONCAT(DISTINCT username) AS users FROM login_log WHERE ts > ?1 AND ok = 1 AND ip <> '' GROUP BY ip HAVING n >= 3 ORDER BY n DESC LIMIT 10").bind(since).all()).results;
-          const u2 = (await db.prepare("SELECT username, COUNT(DISTINCT ip) AS n FROM login_log WHERE ts > ?1 AND ok = 1 GROUP BY username HAVING n >= 4 ORDER BY n DESC LIMIT 10").bind(since).all()).results;
-          multi = { ips: a.map((x) => ({ ip: x.ip, n: x.n, users: String(x.users).split(',').slice(0, 10) })), users: u2 };
+          // 已解除的风险：只有解除之后又出现新的异常（解除时间之后的记录仍然触发）才会重新提示
+          let ok = {};
+          try { for (const r of (await db.prepare('SELECT kind, key, at FROM login_risk_ok').all()).results) ok[r.kind + '|' + r.key] = r.at; } catch (e) {}
+          const a = (await db.prepare("SELECT ip FROM login_log WHERE ts > ?1 AND ok = 1 AND ip <> '' GROUP BY ip HAVING COUNT(DISTINCT username) >= 3 LIMIT 40").bind(since).all()).results;
+          const ips = [];
+          for (const x of a) {
+            const s2 = Math.max(since, ok['ip|' + x.ip] || 0);
+            const r = (await db.prepare('SELECT COUNT(DISTINCT username) AS n, GROUP_CONCAT(DISTINCT username) AS users FROM login_log WHERE ip = ?1 AND ts > ?2 AND ok = 1').bind(x.ip, s2).first());
+            if (r && r.n >= 3) ips.push({ ip: x.ip, n: r.n, users: String(r.users).split(',').slice(0, 10) });
+          }
+          const u0 = (await db.prepare('SELECT username FROM login_log WHERE ts > ?1 AND ok = 1 GROUP BY username HAVING COUNT(DISTINCT ip) >= 4 LIMIT 40').bind(since).all()).results;
+          const users = [];
+          for (const x of u0) {
+            const s2 = Math.max(since, ok['user|' + x.username] || 0);
+            const r = await db.prepare('SELECT COUNT(DISTINCT ip) AS n FROM login_log WHERE username = ?1 AND ts > ?2 AND ok = 1').bind(x.username, s2).first();
+            if (r && r.n >= 4) users.push({ username: x.username, n: r.n });
+          }
+          multi = { ips: ips.sort((p, q) => q.n - p.n).slice(0, 10), users: users.sort((p, q) => q.n - p.n).slice(0, 10) };
         }
       } catch (e) {}
       return json({ ok: true, rows, more: rows.length === 100, risk: multi && multi.ips ? multi : null });
+    }
+
+    case 'admin_risk_dismiss': {   // 解除风险提示：type = ip | user，key = IP 或用户名
+      if (!isAdmin) return fail('需要管理员权限', 403);
+      const kind = b.type === 'user' ? 'user' : 'ip', key = String(b.key || '').trim().slice(0, 64);
+      if (!key) return fail('参数错误');
+      await db.prepare('CREATE TABLE IF NOT EXISTS login_risk_ok (kind TEXT NOT NULL, key TEXT NOT NULL, at INTEGER NOT NULL, by TEXT, PRIMARY KEY (kind, key))').run();
+      await db.prepare('INSERT OR REPLACE INTO login_risk_ok (kind, key, at, by) VALUES (?1,?2,?3,?4)').bind(kind, key, Date.now(), user).run();
+      return json({ ok: true });
     }
 
     case 'admin_logins': {   // 某个用户最近的登录记录（时间、IP、国家、设备、成败）
