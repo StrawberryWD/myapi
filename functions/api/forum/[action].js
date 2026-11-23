@@ -36,7 +36,7 @@ const LIMITS = {
   FOLDER_NAME: 20, FOLDERS_MAX: 20, MARK_PAGE: 20,   // 收藏夹
   TOPIC_GAP_MS: 10000, // 同一用户两次建话题最小间隔
   // 2901网盘
-  MOD_MAX: 20, DRIVE_QUOTA: 500 * 1024 * 1024, DRIVE_FILE_MAX: 25 * 1024 * 1024, IMG_QUOTA: 100 * 1024 * 1024, IMG_MAX: 2 * 1024 * 1024, IMG_DAILY: 40, UP_DAILY: 100,
+  MOD_MAX: 20, HIDE_MAX: 30, DRIVE_QUOTA: 500 * 1024 * 1024, DRIVE_FILE_MAX: 25 * 1024 * 1024, IMG_QUOTA: 100 * 1024 * 1024, IMG_MAX: 2 * 1024 * 1024, IMG_DAILY: 40, UP_DAILY: 100,
   REPO_SOFT: 800 * 1024 * 1024, DRIVE_NAME: 80, DFOLDER_NAME: 30, DFOLDERS_MAX: 100, DFOLDER_DEPTH: 3, DRIVE_PAGE: 50, SHARE_USERS_MAX: 20,
   ATT_POST_IMGS: 9, ATT_POST_FILES: 5, ATT_DM: 1, ORPHAN_MS: 2 * 3600 * 1000,
 };
@@ -45,6 +45,7 @@ const EMSG = {
   topic_exists: '已有同名话题', topic_name: '请填写话题名称（最多 20 字）', topic_desc: '话题说明最多 100 字', topic_many: '话题数量已达上限',
   topic_forbidden: '只有话题创建者或管理员能操作', pin_forbidden: '没有置顶权限', pin_full: '置顶已满（每个范围最多 3 条）',
   pin_scope: '这个帖子不属于该话题', folder_gone: '收藏夹不存在', folder_name: '请填写收藏夹名称（最多 20 字）', folder_many: '收藏夹最多 20 个',
+  hide_many: '最多屏蔽 30 人', hide_nouser: '没有这个用户：', hide_self: '不用屏蔽自己', hide_admin: '不能对管理员屏蔽帖子',
   mod_full: '版主最多 20 人', mod_nouser: '没有这个用户', mod_admin: '管理员不需要设为版主', mod_self: '不能给自己设置',
   post_gone: '帖子不存在或已被删除', admin_only: '需要管理员权限', reply_gone: '这条回复不存在或已被删除', edit_forbidden: '只能修改自己的内容',
   user_gone: '用户不存在', follow_self: '不能关注自己', private: '对方没有公开这部分内容', bio_len: '简介最多 200 字',
@@ -100,6 +101,9 @@ const SCHEMA = [
   'CREATE TABLE IF NOT EXISTS drive_gc (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, path TEXT NOT NULL, sha TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0)',
   'CREATE TABLE IF NOT EXISTS blocks (blocker TEXT NOT NULL, blocked TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (blocker, blocked))',
   'CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks (blocked)',
+  // 发帖时指定「不让这些人看」：post_hidden 里有 (帖子, 用户) 的，这个用户看不到该帖（管理员和作者本人除外）
+  'CREATE TABLE IF NOT EXISTS post_hidden (post_id INTEGER NOT NULL, username TEXT NOT NULL, PRIMARY KEY (post_id, username))',
+  'CREATE INDEX IF NOT EXISTS idx_post_hidden_user ON post_hidden (username)',
   // 举报：举报时只保存被举报的那几条消息的快照，管理员只能看到这些
   'CREATE TABLE IF NOT EXISTS dm_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, reporter TEXT NOT NULL, reported TEXT NOT NULL, reason TEXT NOT NULL DEFAULT \'\', msgs TEXT NOT NULL, created_at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT \'open\', handled_by TEXT, handled_at INTEGER, note TEXT)',
   // 话题（板块）/ 标签 / 置顶 / 收藏
@@ -227,6 +231,7 @@ async function route({ request, env, params, waitUntil }) {
       const id = Number(b.id);
       const post = await db.prepare('SELECT p.*, a.updated_at AS av FROM posts p LEFT JOIN avatars a ON a.username = p.author WHERE p.id = ?1').bind(id).first();
       if (!post) return failc('post_gone', 404);
+      if (!isAdmin && post.author !== user && await db.prepare('SELECT 1 AS x FROM post_hidden WHERE post_id = ?1 AND username = ?2').bind(id, user).first()) return failc('post_gone', 404);
       const { results: rrows } = await db.prepare(`SELECT r.id, r.author, r.body, r.created_at, r.parent_id, r.depth, r.reply_to, r.deleted, r.edited_at, a.updated_at AS av,
                                             (SELECT COUNT(*) FROM reply_likes x WHERE x.reply_id = r.id) AS like_count,
                                             (SELECT COUNT(*) FROM reply_likes x WHERE x.reply_id = r.id AND x.username = ?3) AS liked
@@ -249,6 +254,7 @@ async function route({ request, env, params, waitUntil }) {
       post.can_manage = canManage(post.author);
       post.pin_options = opts;
       post.atts = (await loadAtts(db, 'post', [id])).get(id) || [];
+      if (post.author === user) post.hide = (await db.prepare('SELECT username FROM post_hidden WHERE post_id = ?1 ORDER BY username').bind(id).all()).results.map((x) => x.username);
       return json({ ok: true, me: user, admin: isAdmin, mod: isMod, post, replies: results, poll: await loadPoll(db, id, user, now, isAdmin) });
     }
 
@@ -264,6 +270,9 @@ async function route({ request, env, params, waitUntil }) {
       if (b.poll) { poll = parsePoll(b.poll, now); if (typeof poll === 'string') return fail(poll, 400, 'poll_invalid'); }
       let attRows = [];
       if (Array.isArray(b.att) && b.att.length) { const v = await validateAtt(db, user, b.att, 'post'); if (typeof v === 'string') return failc(v); attRows = v; }
+      const tail = {};
+      const hide = await parseHide(db, b.hide, user, tail);
+      if (typeof hide === 'string') return failc(hide, 400, tail.nouser ? { nouser: tail.nouser } : undefined);
       if (!isAdmin) {
         const last = await db.prepare('SELECT MAX(created_at) AS t FROM posts WHERE author = ?1').bind(user).first();
         if (last && last.t && now - last.t < LIMITS.POST_GAP_MS) return fail('发得太快啦，稍等几秒再发', 429);
@@ -274,6 +283,7 @@ async function route({ request, env, params, waitUntil }) {
       if (meta.topics.length || meta.tags.length) await db.batch(metaStmts(db, id, meta, false));
       if (attRows.length) await db.batch(attRows.map((f) => db.prepare("INSERT OR IGNORE INTO drive_att (file_id, kind, ref) VALUES (?1, 'post', ?2)").bind(f.id, id)));
       if (poll) await db.prepare('INSERT INTO polls (post_id, multi, closes_at, options, anon, vis) VALUES (?1, ?2, ?3, ?4, ?5, ?6)').bind(id, poll.multi, poll.closes_at, JSON.stringify(poll.options), poll.anon, poll.vis).run();
+      if (hide.length) await db.batch(hide.map((n) => db.prepare('INSERT OR IGNORE INTO post_hidden (post_id, username) VALUES (?1, ?2)').bind(id, n)));
       return json({ ok: true, id });
     }
 
@@ -284,6 +294,7 @@ async function route({ request, env, params, waitUntil }) {
       if (!body) return fail('回复内容不能为空');
       const post = await db.prepare('SELECT id FROM posts WHERE id = ?1').bind(pid).first();
       if (!post) return failc('post_gone', 404);
+      if (!isAdmin && await db.prepare('SELECT 1 AS x FROM post_hidden WHERE post_id = ?1 AND username = ?2').bind(pid, user).first()) return failc('post_gone', 404);
       const rc = await db.prepare('SELECT COUNT(*) AS n FROM replies WHERE post_id = ?1').bind(pid).first();
       if (rc.n >= LIMITS.MAX_REPLIES) return fail(`这个帖子回复已满（${LIMITS.MAX_REPLIES} 条），请新开一个帖子`);
       if (!isAdmin) {
@@ -365,6 +376,11 @@ async function route({ request, env, params, waitUntil }) {
         for (const f of addRows) st.push(db.prepare("INSERT OR IGNORE INTO drive_att (file_id, kind, ref) VALUES (?1, 'post', ?2)").bind(f.id, pid));
         await db.batch(st);
       }
+      if (isOwner && Array.isArray(b.hide)) {
+        const tail = {}; const hide = await parseHide(db, b.hide, user, tail);
+        if (typeof hide === 'string') return failc(hide, 400, tail.nouser ? { nouser: tail.nouser } : undefined);
+        await db.batch([db.prepare('DELETE FROM post_hidden WHERE post_id = ?1').bind(pid), ...hide.map((n) => db.prepare('INSERT OR IGNORE INTO post_hidden (post_id, username) VALUES (?1, ?2)').bind(pid, n))]);
+      }
       await db.prepare('UPDATE posts SET title = ?2, body = ?3, edited_at = ?4 WHERE id = ?1').bind(pid, title, body, now).run();
       return json({ ok: true, edited_at: now, atts: (await loadAtts(db, 'post', [pid])).get(pid) || [] });
     }
@@ -386,6 +402,7 @@ async function route({ request, env, params, waitUntil }) {
           db.prepare('DELETE FROM post_tags WHERE post_id = ?1').bind(id),
           db.prepare('DELETE FROM pins WHERE post_id = ?1').bind(id),
           db.prepare('DELETE FROM bookmarks WHERE post_id = ?1').bind(id),
+          db.prepare('DELETE FROM post_hidden WHERE post_id = ?1').bind(id),
           db.prepare('DELETE FROM posts WHERE id = ?1').bind(id),
         ]);
         return json({ ok: true });
@@ -405,6 +422,7 @@ async function route({ request, env, params, waitUntil }) {
       const pid = Number(b.post_id);
       const post = await db.prepare('SELECT id FROM posts WHERE id = ?1').bind(pid).first();
       if (!post) return failc('post_gone', 404);
+      if (!isAdmin && await db.prepare('SELECT 1 AS x FROM post_hidden WHERE post_id = ?1 AND username = ?2').bind(pid, user).first()) return failc('post_gone', 404);
       const had = await db.prepare('SELECT 1 AS x FROM likes WHERE post_id = ?1 AND username = ?2').bind(pid, user).first();
       if (had) await db.prepare('DELETE FROM likes WHERE post_id = ?1 AND username = ?2').bind(pid, user).run();
       else await db.prepare('INSERT OR IGNORE INTO likes (post_id, username, created_at) VALUES (?1, ?2, ?3)').bind(pid, user, now).run();
@@ -417,6 +435,8 @@ async function route({ request, env, params, waitUntil }) {
       const pid = Number(b.post_id);
       const po = await db.prepare('SELECT multi, closes_at, options FROM polls WHERE post_id = ?1').bind(pid).first();
       if (!po) return fail('这个帖子没有投票', 404, 'poll_none');
+      if (!isAdmin && await db.prepare('SELECT 1 AS x FROM post_hidden WHERE post_id = ?1 AND username = ?2').bind(pid, user).first()) return failc('post_gone', 404);
+
       if (po.closes_at && now > po.closes_at) return fail('投票已截止', 400, 'poll_closed');
       const opts = JSON.parse(po.options);
       let sel = Array.isArray(b.options) ? b.options.map(Number) : [];
@@ -639,6 +659,7 @@ async function route({ request, env, params, waitUntil }) {
       const pid = Number(b.post_id);
       const post = await db.prepare('SELECT id FROM posts WHERE id = ?1').bind(pid).first();
       if (!post) return failc('post_gone', 404);
+      if (!isAdmin && await db.prepare('SELECT 1 AS x FROM post_hidden WHERE post_id = ?1 AND username = ?2').bind(pid, user).first()) return failc('post_gone', 404);
       if (b.on === false) await db.prepare('DELETE FROM bookmarks WHERE username = ?1 AND post_id = ?2').bind(user, pid).run();
       else {
         let fid = null;
@@ -743,7 +764,7 @@ async function route({ request, env, params, waitUntil }) {
       const PG = LIMITS.PROFILE_PAGE;
       if (tab === 'comments') {
         const { results } = await db.prepare(`SELECT r.id, r.post_id, r.body, r.created_at, p.title FROM replies r JOIN posts p ON p.id = r.post_id
-                                              WHERE r.author = ?1 AND r.deleted = 0 ORDER BY r.id DESC LIMIT ?2 OFFSET ?3`).bind(name, PG + 1, offset).all();
+                                              WHERE r.author = ?1 AND r.deleted = 0 AND (?4 = 1 OR NOT EXISTS (SELECT 1 FROM post_hidden h WHERE h.post_id = p.id AND h.username = ?5)) ORDER BY r.id DESC LIMIT ?2 OFFSET ?3`).bind(name, PG + 1, offset, isAdmin ? 1 : 0, user).all();
         return json({ ok: true, me: user, comments: results.slice(0, PG), hasMore: results.length > PG });
       }
       let rows;
@@ -1247,6 +1268,7 @@ async function removeReply(db, id) {
 // ---------- 辅助：话题 / 标签 / 列表 ----------
 // 帖子列表的统一查询。where / args 是筛选条件；orderArgs 是 order 里用到的参数（在 limit 之前绑定）
 async function listPosts(db, user, where, args, order, limit, offset, orderArgs) {
+  if (!ADMINS.includes(String(user).toLowerCase())) { where = [...where, HIDDEN_SQL('p.id')]; args = [...args, user]; }
   const sql = `SELECT p.id, p.author, p.title, substr(p.body, 1, 80) AS snippet, p.created_at, p.last_at, p.reply_count, a.updated_at AS av,
                       (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
                       (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id AND l.username = ?) AS liked,
@@ -1493,6 +1515,7 @@ function userContentCleanup(db, u) {
     db.prepare('DELETE FROM post_tags WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
     db.prepare('DELETE FROM pins WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
     db.prepare('DELETE FROM bookmarks WHERE post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
+    db.prepare('DELETE FROM post_hidden WHERE username = ?1 OR post_id IN (SELECT id FROM posts WHERE author = ?1)').bind(u),
     db.prepare('DELETE FROM bookmarks WHERE username = ?1').bind(u),
     db.prepare('DELETE FROM bookmark_folders WHERE username = ?1').bind(u),
     db.prepare('DELETE FROM likes WHERE username = ?1').bind(u),
@@ -1597,6 +1620,25 @@ function checkAnswers(qs, a) {
       if (!t) { if (q.req) return `sv_required|第 ${i + 1} 题必须回答`; out.push(''); continue; }
       out.push(t);
     }
+  }
+  return out;
+}
+
+
+// ---------- 帖子对指定用户屏蔽 ----------
+// 作者本人和管理员永远看得到；其他人如果在 post_hidden 里，就当这个帖子不存在
+const HIDDEN_SQL = (postCol) => `NOT EXISTS (SELECT 1 FROM post_hidden h WHERE h.post_id = ${postCol} AND h.username = ?)`;
+// 校验「屏蔽名单」：返回 [用户名...] 或错误码字符串
+async function parseHide(db, names, self, tail) {
+  const list = [...new Set((Array.isArray(names) ? names : []).map((x) => String(x).trim().replace(/^@/, '')).filter(Boolean))];
+  if (list.length > LIMITS.HIDE_MAX) return 'hide_many';
+  const out = [];
+  for (const n of list) {
+    if (n.toLowerCase() === String(self).toLowerCase()) return 'hide_self';
+    if (ADMINS.includes(n.toLowerCase())) return 'hide_admin';
+    const u = await db.prepare('SELECT username FROM users WHERE username = ?1 COLLATE NOCASE').bind(n).first();
+    if (!u) { tail.nouser = n; return 'hide_nouser'; }
+    out.push(u.username);
   }
   return out;
 }

@@ -322,7 +322,7 @@ async function route({ request, env, params, waitUntil }) {
       ['dm_msgs', 'sender'], ['dm_reports', 'reporter'], ['dm_reports', 'reported'], ['dm_reports', 'handled_by'],
       ['topics', 'creator'], ['pins', 'by'], ['bookmark_folders', 'username'], ['bookmarks', 'username'],
       ['surveys', 'author'], ['survey_responses', 'username'],
-      ['login_log', 'username'], ['forum_mods', 'username'], ['forum_mods', 'granted_by'], ['drive_folders', 'owner'], ['drive_files', 'owner'], ['drive_shares', 'to_user'],
+      ['login_log', 'username'], ['post_hidden', 'username'], ['forum_mods', 'username'], ['forum_mods', 'granted_by'], ['drive_folders', 'owner'], ['drive_files', 'owner'], ['drive_shares', 'to_user'],
     ];
     const st = [
       db.prepare('UPDATE users SET username = ?2, renamed_at = ?3 WHERE username = ?1').bind(oldName, nu, now),
